@@ -1,0 +1,4 @@
+[=== Module openmpi/4.0.4 loaded ===]
+[=== Module cudatoolkit/11.8 loaded ===]
+[=== Module python/3.10 loaded ===]
+[2025-09-09T20:28:45.488] error: *** JOB 7647044 ON cn-a009 CANCELLED AT 2025-09-09T20:28:45 DUE to SIGNAL Terminated ***

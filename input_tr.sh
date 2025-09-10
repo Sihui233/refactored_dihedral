@@ -1,0 +1,3 @@
+python /home/mila/w/weis/DL/group-training-refactored/transformer_dihedral_attn=1_top-k_layer_all_quant_metrics_margins_dirichlet.py 0.00075 0.00000025 18 18 adam 2000 58 random_random 8 1 3072 0.0 0.0 1 42
+# script.py <learning_rate> <weight_decay> <p> <batch_size> <optimizer> <epochs> <k> <batch_experiment> <num_neurons> <zeta> <training_set_size> <momentum> <injected_noise> <num_mlp_layers> <random_seed_int_1> [<random_seed_int_2> ...]
+#python /home/mila/w/weis/DL/group-training-refactored/refactored_polynomials_transformer_make_r2_heatmap_attn=1_top-k_layer_all_quant_metrics_margins_dirichlet.py 0.00075 0.000025 59 39 adam 2000 58 random_random 8 1 3072 0.0 0.0 3 42

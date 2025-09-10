@@ -1,0 +1,41 @@
+
+======== GPU REPORT ========
+
+==============NVSMI LOG==============
+
+Timestamp                                 : Tue Sep  9 20:28:45 2025
+Driver Version                            : 580.82.07
+CUDA Version                              : 13.0
+
+Attached GPUs                             : 1
+GPU 00000000:15:00.0
+    Accounting Mode                       : Enabled
+    Accounting Mode Buffer Size           : 4000
+    Accounted Processes
+        Process ID                        : 3969461
+            GPU Utilization               : 57 %
+            Memory Utilization            : 1 %
+            Max memory usage              : 34198 MiB
+            Time                          : 0 ms
+            Is Running                    : 1
+
+Tue Sep  9 20:28:45 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.82.07              Driver Version: 580.82.07      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  Quadro RTX 8000                On  |   00000000:15:00.0 Off |                    0 |
+| 33%   35C    P2            134W /  260W |   34202MiB /  46080MiB |     94%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A         3969461      C   python3                               34198MiB |
++-----------------------------------------------------------------------------------------+
