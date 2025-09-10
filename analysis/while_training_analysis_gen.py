@@ -1,4 +1,4 @@
-# while_training_analysis_MLP.py
+# analysis/while_training_analysis_MLP.py
 from typing import Dict, List, Tuple, Optional, Callable
 import jax
 import jax.numpy as jnp
@@ -100,3 +100,116 @@ def run_epochs(*,
                         f"with total loss {test_loss:.6f} and CE-only loss {test_ce:.6f} ***"
                     )
     return states, logs_by_seed, first_100, first_loss, first_ce
+
+
+###### MLP #########
+
+
+###### Trans ########
+
+from functools import partial
+# 1)  pure-JAX embedding extractor
+def compute_embeddings_transformer(
+    model,
+    params: dict,
+    x: jnp.ndarray,                       # (B , 2)  int32 tokens  (a , b)
+    *,
+    concat: bool = False,                 # False →  “Eₐ + E_b”    True →  “[Eₐ‖E_b]”
+) -> jnp.ndarray:
+    """
+    Returns the *input* embedding vector that will be fed into the first
+    Transformer block, **after** adding learnt position embeddings.
+
+    • `concat == False`   →  shape  (B , D)
+    • `concat == True`    →  shape  (B , 2 D)
+    """
+    # ---- 1. grab weights ----------------------------------------------------
+    # shared token table (W_E)  &  first two learned position vectors
+    Wa, Wb = model.extract_embeddings_ab(params)            # (p , D)
+    pos0, pos1 = params["pos_embed"]["W_pos"][:2]                   # (D,)
+    a_idx = x[:, 0]
+    b_idx = x[:, 1]
+
+    # ---- 2. look-up & add positions ----------------------------------------
+    emb_a = Wa[a_idx] + pos0                              # (B, D)
+    emb_b = Wb[b_idx] + pos1                                   # (B , D)
+
+    if concat:
+        return jnp.concatenate([emb_a, emb_b], axis=-1)   # (B, 2D)
+    else:
+        return emb_a + emb_b                                     # (B , D)
+
+# 2)  make_energy_funcs_transformer
+def make_energy_funcs_transformer(
+    model,           # the *initialised* model instance
+    params: dict,                   # its parameters
+    *,
+    concat: bool = False,
+):
+    """
+    Returns two callables **emb_fn** and **batch_energy_sum** that exactly
+    mirror the MLP helpers:
+
+    • emb_fn(x_int)              →  embedding batch  (see above)
+    • batch_energy_sum(e_batch)  →  Σ ‖J‖²_F  over that *batch*
+
+    where J is the Jacobian  ∂ logits / ∂ embedding.
+    """
+
+    # ---------- f_embed : (D,) or (2D,)  →  (p,) logits ----------------------
+    Wa, _ = model.extract_embeddings_ab(params)
+    D = Wa.shape[1]
+
+    def _to_seq(x_flat: jnp.ndarray) -> jnp.ndarray:
+        if concat:
+            ea, eb = jnp.split(x_flat, 2)
+        else:
+            ea = x_flat * 0.5
+            eb = x_flat * 0.5
+        return jnp.stack([ea, eb])[None, ...]             # (1, 2, D)
+
+    def f_embed(x_flat: jnp.ndarray) -> jnp.ndarray:      # → (p,)
+        seq_emb = _to_seq(x_flat)                         # (1, 2, D)
+        logits  = model.call_from_embedding_sequence(seq_emb, params)[0]
+        return logits[-1]                                  # last-token logits
+
+    f_embed = jax.jit(f_embed)
+
+    def _squared_frobenius_norm_of_jac(x_flat: jnp.ndarray) -> jnp.ndarray:
+        J = jax.jacrev(f_embed)(x_flat)                   # (p, D | 2D)
+        return jnp.sum(J * J)
+
+    _squared_frobenius_norm_of_jac = jax.jit(_squared_frobenius_norm_of_jac)
+
+    emb_fn = partial(compute_embeddings_transformer, model, params, concat=concat)
+
+    def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
+        return jax.vmap(_squared_frobenius_norm_of_jac)(batch_emb).sum()
+
+    return emb_fn, batch_energy_sum
+
+# 3)  driver that averages over an arbitrary input set
+def compute_dirichlet_energy_embedding_transformer(
+    model,
+    params: dict,
+    x_data: jnp.ndarray,                 # (N , 2)  all (a , b) pairs of interest
+    *,
+    batch_size: int = 1024,
+    concat: bool = False,
+) -> float:
+    """
+    Plain (non-JIT) wrapper that chunks `x_data` to keep memory modest.
+    """
+    emb_fn, batch_energy_sum = make_energy_funcs_transformer(
+        model, params, concat=concat
+    )
+
+    total = 0.0
+    n     = x_data.shape[0]
+
+    for i in range(0, n, batch_size):
+        x_batch   = x_data[i : i + batch_size]
+        e_batch   = emb_fn(x_batch)                       # (B , D | 2D)
+        total    += batch_energy_sum(e_batch)
+
+    return float(total / n)

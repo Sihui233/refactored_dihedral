@@ -28,7 +28,7 @@ from controllers.paths_MLP import base_dir, model_dir, seed_graph_dir
 
 # Prep / training / post-training modules
 import controllers.training_prep_MLP as prep
-import analysis.while_training_analysis_MLP as wta
+import analysis.while_training_analysis_gen as wta
 import analysis.post_training_analysis_MLP as pta
 
 from color_rules import colour_quad_a_only
