@@ -263,11 +263,11 @@ def run_post_training_analysis(*,
         dihedral.check_representation_consistency(G, R, dihedral.mult, p)
     rho_cache = DFT.build_rho_cache(G, irreps)
     dft_fn    = DFT.jit_wrap_group_dft(rho_cache, irreps, group_size)
-    subgroups = dihedral.enumerate_subgroups_Dn(p)
+    # subgroups = dihedral.enumerate_subgroups_Dn(p)
 
-    # coset mask (for make_layer_report)
-    coset_masks_L = dihedral.build_coset_masks(G, subgroups, dihedral.mult, p, side="left")
-    coset_masks_R = dihedral.build_coset_masks(G, subgroups, dihedral.mult, p, side="right")
+    # # coset mask (for make_layer_report)
+    # coset_masks_L = dihedral.build_coset_masks(G, subgroups, dihedral.mult, p, side="left")
+    # coset_masks_R = dihedral.build_coset_masks(G, subgroups, dihedral.mult, p, side="right")
 
     for seed_idx, seed in enumerate(random_seed_ints):
         print(f"\n=== Post-training analysis for seed {seed} ===")
@@ -294,11 +294,6 @@ def run_post_training_analysis(*,
                 prei_grid, left, right, dft_fn, irreps, freq_map,
                 prune_cfg={"thresh1": thresh_small, "thresh2": thresh_small, "seed": 0},
             )
-            report.make_layer_report(
-                prei_grid, left, right, p,
-                dft_fn, irreps, coset_masks_L, coset_masks_R,
-                gdir, cluster_tau, colour_rule, artifacts,
-            )
 
             # per layer cluster based on freq
             clusters_layer = artifacts["freq_cluster"]  # {freq: [neuron ids]}
@@ -310,37 +305,44 @@ def run_post_training_analysis(*,
             approx = report.summarize_diag_labels(diag_labels, p, names)
             with open(os.path.join(gdir, f"approx_summary_layer{layer_idx+1}_p{p}.json"), "w") as f:
                 json.dump(approx, f, indent=2)
+            
+        #     # commented out for scaling
+        #     report.make_layer_report(
+        #         prei_grid, left, right, p,
+        #         dft_fn, irreps, coset_masks_L, coset_masks_R,
+        #         gdir, cluster_tau, colour_rule, artifacts,
+        #     )
 
-        # preacts + cluster→logits
-        preacts, X_in, weights_by_layer, cluster_contribs, cluster_W_blocks = get_all_preacts_and_embeddings(
-            model=model, params=params_seed, group_size=group_size, clusters_by_layer=layers_freq,
-        )
+        # # preacts + cluster→logits
+        # preacts, X_in, weights_by_layer, cluster_contribs, cluster_W_blocks = get_all_preacts_and_embeddings(
+        #     model=model, params=params_seed, group_size=group_size, clusters_by_layer=layers_freq,
+        # )
 
-        # write per-cluster JSON
-        pdf_root = os.path.join(gdir, "pdf_plots", f"seed_{seed}")
-        os.makedirs(pdf_root, exist_ok=True)
-        json_root = make_some_jsons(
-            preacts=preacts,
-            group_size=group_size,
-            clusters_by_layer=layers_freq,
-            cluster_weights_to_logits=cluster_W_blocks,
-            cluster_contribs_to_logits=cluster_contribs,  # sanity check 可开关
-            save_dir=pdf_root,
-            sanity_check=True,
-        )
-        print(f"Wrote cluster JSONs to {json_root}")
+        # # write per-cluster JSON
+        # pdf_root = os.path.join(gdir, "pdf_plots", f"seed_{seed}")
+        # os.makedirs(pdf_root, exist_ok=True)
+        # json_root = make_some_jsons(
+        #     preacts=preacts,
+        #     group_size=group_size,
+        #     clusters_by_layer=layers_freq,
+        #     cluster_weights_to_logits=cluster_W_blocks,
+        #     cluster_contribs_to_logits=cluster_contribs,  # sanity check 可开关
+        #     save_dir=pdf_root,
+        #     sanity_check=True,
+        # )
+        # print(f"Wrote cluster JSONs to {json_root}")
 
-        # draw cluster→logits PDF
-        num_pc = 4 if "cheating" not in mlp_class_lower else 2
-        for freq, C_freq in cluster_contribs.items():
-            generate_pdf_plots_for_matrix(
-                C_freq, p,
-                save_dir=pdf_root, seed=seed,
-                freq_list=[freq],
-                tag=f"cluster_contributions_to_logits_freq={freq}",
-                tag_q="full",
-                colour_rule=colour_quad_mod_g,
-                class_string=mlp_class_lower,
-                num_principal_components=num_pc,
-            )
-        print(f"PDF plots written → {pdf_root}")
+        # # draw cluster→logits PDF
+        # num_pc = 4 if "cheating" not in mlp_class_lower else 2
+        # for freq, C_freq in cluster_contribs.items():
+        #     generate_pdf_plots_for_matrix(
+        #         C_freq, p,
+        #         save_dir=pdf_root, seed=seed,
+        #         freq_list=[freq],
+        #         tag=f"cluster_contributions_to_logits_freq={freq}",
+        #         tag_q="full",
+        #         colour_rule=colour_quad_mod_g,
+        #         class_string=mlp_class_lower,
+        #         num_principal_components=num_pc,
+        #     )
+        # print(f"PDF plots written → {pdf_root}")

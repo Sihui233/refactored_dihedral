@@ -90,6 +90,45 @@ def make_train_batches(p: int, batch_size: int, k: int, random_seed_ints: List[i
     print(f"Dataset size per model: {dataset_size_mb:.2f} MB")
     return train_ds_list, x_batches, y_batches
 
+def shuffle_batches_for_epoch(
+    x_batches: jnp.ndarray,  # (M, K, B, 2)
+    y_batches: jnp.ndarray,  # (M, K, B)
+    epoch: int,
+    seeds: List[int],
+    shuffle_within_batch: bool = True,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    M, K, B = x_batches.shape[0], x_batches.shape[1], x_batches.shape[2]
+
+    # 1) shuffle batch order (axis=1)
+    perms_k = jnp.stack(
+        [jax.random.permutation(jax.random.fold_in(jax.random.PRNGKey(s), epoch), K)
+         for s in seeds],
+        axis=0
+    )  # (M, K)
+
+    # use take_along_axis to reorder on axis=1
+    gather_idx_k_x = jnp.broadcast_to(perms_k[:, :, None, None], (M, K, B, 1))
+    gather_idx_k_y = jnp.broadcast_to(perms_k[:, :, None],       (M, K, B))
+    x_shuf = jnp.take_along_axis(x_batches, gather_idx_k_x, axis=1)
+    y_shuf = jnp.take_along_axis(y_batches, gather_idx_k_y, axis=1)
+
+    if not shuffle_within_batch:
+        return x_shuf, y_shuf
+
+    # 2) shuffle samples within each batch (axis=2)
+    perms_b = jnp.stack(
+        [jax.random.permutation(jax.random.fold_in(jax.random.PRNGKey(s ^ 0xBEEF), epoch), B)
+         for s in seeds],
+        axis=0
+    )  # (M, B)
+
+    gather_idx_b_x = jnp.broadcast_to(perms_b[:, None, :, None], (M, K, B, 1))
+    gather_idx_b_y = jnp.broadcast_to(perms_b[:, None, :],       (M, K, B))
+    x_shuf = jnp.take_along_axis(x_shuf, gather_idx_b_x, axis=2)
+    y_shuf = jnp.take_along_axis(y_shuf, gather_idx_b_y, axis=2)
+
+    return x_shuf, y_shuf
+
 def make_full_eval_grid(p: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     G, _ = DFT.make_irreps_Dn(p)
     idx = {g: i for i, g in enumerate(G)}

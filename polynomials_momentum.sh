@@ -7,6 +7,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:rtx8000:1
 
+# polynomials_momentum.sh
 # === Load common modules ===
 module reset
 # module load openmpi/4.0.4
@@ -31,7 +32,7 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$CUDA_HOME/extras/CUPTI/lib64:$LD_LIBRAR
 export CPATH=$CUDA_HOME/include:$HOME/.local/include:$CPATH
 export LD_LIBRARY_PATH=$HOME/.local/lib:$LD_LIBRARY_PATH
 # === Change to working directory ===
-cd /home/mila/w/weis/scratch/DL/freq
+cd /home/mila/w/weis/DL/refactored_dihedral
 
 # === Run your training script ===
-python /home/mila/w/weis/DL/group-training-refactored/train_mlp_multilayer_dihedral.py "$@"
+python3 -m run.run_training_MLP "$@"

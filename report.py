@@ -365,7 +365,7 @@ def _classify_by_gft(Fhat_n, names, freq_map, *, strict=True):
             fa = fb = int(freq_map[r_star])
     else:
         kind = "axis"
-        r_star, s_star = names[ib], names[ia]   # 和你原 dominant_irrep 的返回保持一致
+        r_star, s_star = names[ib], names[ia]
         fa = int(freq_map.get(s_star, -1)) if s_star in freq_map else None
         fb = int(freq_map.get(r_star, -1)) if r_star in freq_map else None
         if strict and (fa is None or fb is None):
@@ -1226,7 +1226,7 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
             f = int(freq_map[r_star])
             freq_cluster[f].append(int(n))  
             
-            diag_labels.add(r_star)
+            diag_labels.add((r_star, dom["kind"]))
         
         if dom["kind"] == "diag" and dom["fa"] is not None:
             freq_clust_2d["diag"][dom["fa"]].append(int(n))
@@ -1302,10 +1302,14 @@ def summarize_diag_labels(diag_labels: Iterable[str], p: int, names: List[str]) 
       - approx_coset:   2D_x and gcd(p, x) == 1
       - coset_2d:       2D_x and gcd(p, x)  > 1
       - coset_1d:       {sign, rp, srp}
+      - kinds:          axis, diag
     return a JSON file, including details of grouping, counting, total number consistency, and approx_coset ratio.
     """
-    diag_labels = set(str(lab) for lab in diag_labels) 
+    diag_labels = set((str(label).strip(), str(kind).strip()) for label, kind in diag_labels)
     total_diag = len(diag_labels)
+    label_kind_map = defaultdict(set)
+    for label, kind in diag_labels:
+        label_kind_map[label].add(kind)
 
     names_1d = {"sign", "rp", "srp"}
 
@@ -1315,20 +1319,25 @@ def summarize_diag_labels(diag_labels: Iterable[str], p: int, names: List[str]) 
     coset_2d     = []  # 2D_x & gcd(p,x)>1
     coset_1d     = []  # sign/rp/srp
     others       = [] 
-    
-    for lab in diag_labels:
-        s = lab.strip()
-        m = pat_2d.match(s)
+
+    for label, kinds in label_kind_map.items():
+        m = pat_2d.match(label)
+        kinds_list = sorted(kinds)
+
         if m:
             f = int(m.group(1))
-            if math.gcd(p, f) == 1:
-                approx_coset.append({"label": s, "f": f, "gcd_pf": 1})
+            gcd_pf = math.gcd(p, f)
+            item = {"label": label, "kinds": kinds_list, "f": f, "gcd_pf": gcd_pf}
+            if gcd_pf == 1:
+                approx_coset.append(item)
             else:
-                coset_2d.append({"label": s, "f": f, "gcd_pf": math.gcd(p, f)})
-        elif s.lower() in names_1d:
-            coset_1d.append({"label": s})
+                coset_2d.append(item)
+        elif label.lower() in names_1d:
+            coset_1d.append({"label": label, "kinds": kinds_list})
         else:
-            others.append({"label": s})
+            others.append({"label": label, "kinds": kinds_list})
+
+    total_diag = len(label_kind_map)
 
     counts = {
         "approx_coset": len(approx_coset),
@@ -1338,11 +1347,21 @@ def summarize_diag_labels(diag_labels: Iterable[str], p: int, names: List[str]) 
         "total_diag":   total_diag,
     }
 
-    # consistency check：sum of 3 types + others == #diag_labels
+    # Consistency check
     sum_all = counts["approx_coset"] + counts["coset_2d"] + counts["coset_1d"] + counts["others"]
     consistency_ok = (sum_all == total_diag)
 
-    # approx coset proportion
+    # Collect all processed labels to check consistency
+    processed_labels = set()
+    for group in [approx_coset, coset_2d, coset_1d, others]:
+        for item in group:
+            processed_labels.add(item["label"])
+
+    missing_labels = []
+    if not consistency_ok:
+        missing_labels = list(sorted(set(label_kind_map.keys()) - processed_labels))
+
+    # Approx ratio
     approx_ratio = (counts["approx_coset"] / total_diag) if total_diag > 0 else 0.0
 
     summary = {
@@ -1359,14 +1378,64 @@ def summarize_diag_labels(diag_labels: Iterable[str], p: int, names: List[str]) 
             "ok": consistency_ok,
             "sum_all": sum_all,
             "expected_total": total_diag,
-            "missing_when_not_ok": (
-                [] if consistency_ok else
-                list(sorted(diag_labels - set(x["label"] for grp in [approx_coset, coset_2d, coset_1d, others] for x in grp)))
-            )
+            "missing_when_not_ok": missing_labels,
         },
         "approx_ratio_in_diag": approx_ratio,
     }
+
     return summary
+    
+    # for lab in diag_labels:
+    #     s = lab.strip()
+    #     m = pat_2d.match(s)
+    #     if m:
+    #         f = int(m.group(1))
+    #         if math.gcd(p, f) == 1:
+    #             approx_coset.append({"label": s, "f": f, "gcd_pf": 1})
+    #         else:
+    #             coset_2d.append({"label": s, "f": f, "gcd_pf": math.gcd(p, f)})
+    #     elif s.lower() in names_1d:
+    #         coset_1d.append({"label": s})
+    #     else:
+    #         others.append({"label": s})
+
+    # counts = {
+    #     "approx_coset": len(approx_coset),
+    #     "coset_2d":     len(coset_2d),
+    #     "coset_1d":     len(coset_1d),
+    #     "others":       len(others),
+    #     "total_diag":   total_diag,
+    # }
+
+    # # consistency check：sum of 3 types + others == #diag_labels
+    # sum_all = counts["approx_coset"] + counts["coset_2d"] + counts["coset_1d"] + counts["others"]
+    # consistency_ok = (sum_all == total_diag)
+
+    # # approx coset proportion
+    # approx_ratio = (counts["approx_coset"] / total_diag) if total_diag > 0 else 0.0
+
+    # summary = {
+    #     "p": p,
+    #     "names": names,
+    #     "items": {
+    #         "approx_coset": approx_coset,
+    #         "coset_2d":     coset_2d,
+    #         "coset_1d":     coset_1d,
+    #         "others":       others,
+    #     },
+    #     "counts": counts,
+    #     "consistency": {
+    #         "ok": consistency_ok,
+    #         "sum_all": sum_all,
+    #         "expected_total": total_diag,
+    #         "missing_when_not_ok": (
+    #             [] if consistency_ok else
+    #             list(sorted(diag_labels - set(x["label"] for grp in [approx_coset, coset_2d, coset_1d, others] for x in grp)))
+    #         )
+    #     },
+    #     "approx_ratio_in_diag": approx_ratio,
+    # }
+    # return summary
 
 # ---------------------------------------------------------------------------
 # main entry

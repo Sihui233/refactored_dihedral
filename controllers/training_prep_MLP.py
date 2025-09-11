@@ -116,6 +116,73 @@ def make_train_batches(p: int, batch_size: int, k: int, random_seed_ints: List[i
 
     return train_ds_list, x_batches, y_batches
 
+
+
+def shuffle_batches_for_epoch(
+    x_batches: jnp.ndarray,  # (M, K, B, 2)
+    y_batches: jnp.ndarray,  # (M, K, B)
+    epoch: int,
+    seeds: List[int],
+    shuffle_within_batch: bool = True,
+    debug: bool = False,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    M, K, B = x_batches.shape[0], x_batches.shape[1], x_batches.shape[2]
+
+    # 1) shuffle batch order (axis=1)
+    perms_k = jnp.stack(
+        [jax.random.permutation(jax.random.fold_in(jax.random.PRNGKey(s), epoch), K)
+         for s in seeds],
+        axis=0
+    )  # (M, K)
+
+    # use take_along_axis to reorder on axis=1
+    gather_idx_k_x = jnp.broadcast_to(perms_k[:, :, None, None], (M, K, B, 1))
+    gather_idx_k_y = jnp.broadcast_to(perms_k[:, :, None],       (M, K, B))
+    x_shuf = jnp.take_along_axis(x_batches, gather_idx_k_x, axis=1)
+    y_shuf = jnp.take_along_axis(y_batches, gather_idx_k_y, axis=1)
+
+    if not shuffle_within_batch:
+        return x_shuf, y_shuf
+
+    # 2) shuffle samples within each batch (axis=2)
+    perms_b = jnp.stack(
+        [jax.random.permutation(jax.random.fold_in(jax.random.PRNGKey(s ^ 0xBEEF), epoch), B)
+         for s in seeds],
+        axis=0
+    )  # (M, B)
+
+    gather_idx_b_x = jnp.broadcast_to(perms_b[:, None, :, None], (M, K, B, 1))
+    gather_idx_b_y = jnp.broadcast_to(perms_b[:, None, :],       (M, K, B))
+    x_shuf = jnp.take_along_axis(x_shuf, gather_idx_b_x, axis=2)
+    y_shuf = jnp.take_along_axis(y_shuf, gather_idx_b_y, axis=2)
+
+    if debug:
+        # sample to check
+        i_samp = [0, min(M-1, 1)]
+        j_samp = [0, min(K-1, 1)]
+        k_samp = [0, min(B-1, 1)]
+
+        pk = np.asarray(perms_k)  
+        pb = np.asarray(perms_b) if perms_b is not None else None
+
+        for i in i_samp:
+            for j in j_samp:
+                for k in k_samp:
+                    # after shuffle (i,j,k) correspond to the original (i, pk[i,j], pb[i,k] or k)
+                    jj = pk[i, j]
+                    kk = pb[i, k] if pb is not None else k
+
+                    x_ref = np.asarray(x_batches[i, jj, kk, :])
+                    y_ref = np.asarray(y_batches[i, jj, kk])
+                    x_now = np.asarray(x_shuf[i, j, k, :])
+                    y_now = np.asarray(y_shuf[i, j, k])
+
+                    assert np.array_equal(x_now, x_ref), f"x mismatch at (i={i}, j={j}, k={k})"
+                    assert y_now == y_ref,               f"y mismatch at (i={i}, j={j}, k={k})"
+        print("[shuffle] debug check passed: x/y still aligned.")
+
+    return x_shuf, y_shuf
+
 def make_full_eval_grid(p: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Build (|G|^2, 2) inputs and labels for D_n group multiplication."""
     G, _ = DFT.make_irreps_Dn(p)
