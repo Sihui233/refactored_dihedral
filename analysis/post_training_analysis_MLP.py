@@ -1,11 +1,12 @@
 # analysis/post_training_analysis.py
 import os
 import json
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union, Any
 import numpy as np
 import jax
 import jax.numpy as jnp
-
+import os, json
+from collections import Counter
 import DFT
 import dihedral
 import report
@@ -233,6 +234,7 @@ def make_some_jsons(
 
     return json_root
 
+
 def run_post_training_analysis(*,
     model,
     states,
@@ -306,12 +308,14 @@ def run_post_training_analysis(*,
             with open(os.path.join(gdir, f"approx_summary_layer{layer_idx+1}_p{p}.json"), "w") as f:
                 json.dump(approx, f, indent=2)
             
-        #     # commented out for scaling
-        #     report.make_layer_report(
-        #         prei_grid, left, right, p,
-        #         dft_fn, irreps, coset_masks_L, coset_masks_R,
-        #         gdir, cluster_tau, colour_rule, artifacts,
-        #     )
+            # # commented out for scaling
+            # report_dir = os.path.join(gdir, f"report_layer{layer_idx+1}")
+            # os.makedirs(report_dir, exist_ok=True)
+            # report.make_layer_report(
+            #     prei_grid, left, right, p,
+            #     dft_fn, irreps, coset_masks_L, coset_masks_R,
+            #     report_dir, cluster_tau, colour_rule, artifacts,
+            # )
 
         # # preacts + cluster→logits
         # preacts, X_in, weights_by_layer, cluster_contribs, cluster_W_blocks = get_all_preacts_and_embeddings(

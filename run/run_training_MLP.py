@@ -72,10 +72,13 @@ def main(argv):
     #     weight_decay=cfg.weight_decay,
     #     epochs=cfg.epochs,
     #     eval_every=cfg.eval_every if hasattr(cfg, "eval_every") and cfg.eval_every else 5000,
-    #     eval_fn=eval_fn, # you could pass eval_batches=(x_eval_batches, y_eval_batches) instead
+    #     eval_flat=(x_eval, y_eval), # for margins
+    #     # eval_fn=eval_fn, # you could pass eval_batches=(x_eval_batches, y_eval_batches) instead
     # )
 
+    
     states, logs_by_seed, first_100, first_loss, first_ce = wta.run_epochs_scaling(
+        model=model,
         states=states,
         x_batches=x_batches,
         y_batches=y_batches,
@@ -83,8 +86,10 @@ def main(argv):
         random_seed_ints=cfg.random_seeds,
         weight_decay=cfg.weight_decay,
         epochs=cfg.epochs,
-        eval_every=cfg.eval_every if hasattr(cfg, "eval_every") and cfg.eval_every else 5000,
-        eval_fn=eval_fn, # you could pass eval_batches=(x_eval_batches, y_eval_batches) instead
+        eval_batches=(x_eval_batches, y_eval_batches),
+        eval_every=1,
+        eval_flat=(x_eval, y_eval), # for margins
+        # eval_fn=eval_fn, # you could pass eval_batches=(x_eval_batches, y_eval_batches) instead
     )
 
 

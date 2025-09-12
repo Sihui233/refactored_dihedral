@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=b
+#SBATCH --job-name=scaling
 #SBATCH --output=/home/mila/w/weis/scratch/DL/hypersearch/b%j.txt
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

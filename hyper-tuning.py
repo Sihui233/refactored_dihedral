@@ -16,11 +16,11 @@ import random
 # SEEDS = list(range(10))     
 
 # test
-LR_LIST = [1e-5, 2e-5]
-WD_LIST = [1e-3, 1e-4]
-P_LIST = [2 ** e for e in range(2, 5)]    # 2^2 ... 2^12
-NUM_LAYERS_LIST = [1, 2]
-SEEDS = list(range(5))  
+LR_LIST = [1e-5]
+WD_LIST = [1e-3]
+P_LIST = [2 ** e for e in range(4, 5)]
+NUM_LAYERS_LIST = [2]
+SEEDS = list(range(1))  
 
 # -----------------------------
 # global variables
