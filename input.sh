@@ -1,6 +1,6 @@
 # "Usage: script.py <learning_rate> <weight_decay> <p> <batch_size> <optimizer> <epochs> <k> <batch_experiment> <num_neurons> <MLP_class> <features> <num_layers> <random_seed_int_1> [<random_seed_int_2> ...]")
 # python3 train_mlp_multilayer_dihedral.py 0.001 0.0001 18 18 adam 2500 58 random_random 128 two_embed 128 1 5
-python3 -m run.run_training_MLP 0.001 0.0001 19 19 adam 2500 61 random_random 128 two_embed 128 1 0
+python3 -m run.run_training_MLP 0.001 0.0001 19 38 adam 2500 30 random_random 128 two_embed 128 1 0 1 2
 
 # python3 /home/mila/w/weis/DL/refactored_dihedral/run/run_training_MLP.py 0.001 0.0001 24 24 adam 2500 77 random_random 512 two_embed 128 1 0
 

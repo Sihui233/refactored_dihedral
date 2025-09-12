@@ -10,6 +10,7 @@ import optax
 from clu import metrics
 from flax import struct
 import jax.tree_util
+from functools import partial
 
 import dihedral
 import DFT
@@ -96,120 +97,204 @@ def build_optimizer(optimizer_name: str, lr: float):
     raise ValueError(f"Unsupported optimizer type: {optimizer_name}")
 
 # ---------------- Dataset / eval grid ----------------
-def make_train_batches(p: int, batch_size: int, k: int, random_seed_ints: List[int]):
-    """Create per-seed dihedral dataset and stack to (num_models, k, batch, 2)."""
-    train_ds_list = []
+# def make_train_batches(p: int, batch_size: int, k: int, random_seed_ints: List[int]):
+#     """Create per-seed dihedral dataset and stack to (num_models, k, batch, 2)."""
+#     train_ds_list = []
+#     for seed in random_seed_ints:
+#         x, y = dihedral.make_dihedral_dataset(p, batch_size, k, seed)
+#         train_ds_list.append((x, y))
+#     x_batches = jnp.stack([x for (x, _) in train_ds_list])
+#     y_batches = jnp.stack([y for (_, y) in train_ds_list])
+#     print("x_batches.shape =", x_batches.shape)
+#     print("y_batches.shape =", y_batches.shape)
+
+#     print(f"Number of training batches: {x_batches.shape[1]}")
+#     print("made dataset")
+
+#     dataset_size_bytes = (x_batches.size * x_batches.dtype.itemsize)
+#     dataset_size_mb = dataset_size_bytes / (1024 ** 2)
+#     print(f"Dataset size per model: {dataset_size_mb:.2f} MB")
+
+#     return train_ds_list, x_batches, y_batches
+
+# def make_full_eval_grid(p: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+#     """Build (|G|^2, 2) inputs and labels for D_n group multiplication."""
+#     G, _ = DFT.make_irreps_Dn(p)
+#     idx = {g: i for i, g in enumerate(G)}
+#     group_size = len(G)
+#     x_eval = jnp.array([[idx[g], idx[h]] for g in G for h in G], dtype=jnp.int32)
+#     y_eval = jnp.array([idx[dihedral.mult(g, h, p)] for g in G for h in G], dtype=jnp.int32)
+#     return x_eval, y_eval  # shapes: (4p^2,2), (4p^2,)
+
+# def pad_to_batches(x_eval, y_eval, batch_size: int, num_models: int):
+#     """Tile eval to all models and pad to whole batches."""
+#     x_exp = jnp.tile(x_eval[None, :, :], (num_models, 1, 1))
+#     y_exp = jnp.tile(y_eval[None, :], (num_models, 1))
+#     total, bs = x_eval.shape[0], batch_size
+#     n_full, remain = total // bs, total % bs
+#     if remain > 0:
+#         pad = bs - remain
+#         x_pad = x_exp[:, :pad, :]
+#         y_pad = y_exp[:, :pad]
+#         x_eval_padded = jnp.concatenate([x_exp, x_pad], axis=1)
+#         y_eval_padded = jnp.concatenate([y_exp, y_pad], axis=1)
+#         n_batches = n_full + 1
+#     else:
+#         x_eval_padded, y_eval_padded, n_batches = x_exp, y_exp, n_full
+#     x_batches = x_eval_padded.reshape(num_models, n_batches, bs, 2)
+#     y_batches = y_eval_padded.reshape(num_models, n_batches, bs)
+#     return x_batches, y_batches
+
+def make_train_and_test_batches(
+    p: int,
+    batch_size: int,
+    k: int,
+    random_seed_ints: List[int],
+    *,
+    test_batch_size: int | None = None,
+    shuffle_test: bool = True,
+    drop_remainder: bool = True,
+) -> Tuple[
+    List[Tuple[jnp.ndarray, jnp.ndarray]],
+    jnp.ndarray, jnp.ndarray,       # x_train_batches, y_train_batches
+    jnp.ndarray, jnp.ndarray        # x_test_batches,  y_test_batches
+]:
+    """
+    Builds per-seed train batches (as before) and test batches (complement of train).
+    Shapes:
+      x_train_batches: (M, k, batch_size, 2)
+      y_train_batches: (M, k, batch_size)
+      x_test_batches:  (M, K_test, B_test, 2)
+      y_test_batches:  (M, K_test, B_test)
+    """
+    train_list: List[Tuple[jnp.ndarray, jnp.ndarray]] = []
+    x_train_stack = []
+    y_train_stack = []
+    x_test_stack = []
+    y_test_stack = []
+
     for seed in random_seed_ints:
-        x, y = dihedral.make_dihedral_dataset(p, batch_size, k, seed)
-        train_ds_list.append((x, y))
-    x_batches = jnp.stack([x for (x, _) in train_ds_list])
-    y_batches = jnp.stack([y for (_, y) in train_ds_list])
-    print("x_batches.shape =", x_batches.shape)
-    print("y_batches.shape =", y_batches.shape)
+        x_tr, y_tr, x_te, y_te = dihedral.make_dihedral_dataset_with_test(
+            p, batch_size, k, seed,
+            test_batch_size=test_batch_size,
+            shuffle_test=shuffle_test,
+            drop_remainder=drop_remainder,
+        )
+        train_list.append((x_tr, y_tr))
+        x_train_stack.append(x_tr)
+        y_train_stack.append(y_tr)
+        x_test_stack.append(x_te)
+        y_test_stack.append(y_te)
 
-    print(f"Number of training batches: {x_batches.shape[1]}")
-    print("made dataset")
+    x_train_batches = jnp.stack(x_train_stack, axis=0)
+    y_train_batches = jnp.stack(y_train_stack, axis=0)
 
-    dataset_size_bytes = (x_batches.size * x_batches.dtype.itemsize)
+    # Sanity: ensure all seeds produced the same K_test and B_test
+    K_tests = [arr.shape[0] for arr in x_test_stack]
+    B_tests = [arr.shape[1] for arr in x_test_stack]
+    if len(set(K_tests)) != 1 or len(set(B_tests)) != 1:
+        raise ValueError(f"Test batch shapes differ across seeds: K={K_tests}, B={B_tests}")
+
+    x_test_batches = jnp.stack(x_test_stack, axis=0)
+    y_test_batches = jnp.stack(y_test_stack, axis=0)
+
+    print("x_train_batches.shape =", x_train_batches.shape)
+    print("y_train_batches.shape =", y_train_batches.shape)
+    print("x_test_batches.shape  =", x_test_batches.shape)
+    print("y_test_batches.shape  =", y_test_batches.shape)
+    print(f"Number of train batches per model: {x_train_batches.shape[1]}")
+    print(f"Number of test  batches per model: {x_test_batches.shape[1]}")
+
+    # Size info (train only, since test size depends on complement)
+    dataset_size_bytes = (x_train_batches.size * x_train_batches.dtype.itemsize)
     dataset_size_mb = dataset_size_bytes / (1024 ** 2)
-    print(f"Dataset size per model: {dataset_size_mb:.2f} MB")
+    print(f"Train dataset size per model: {dataset_size_mb:.2f} MB")
 
-    return train_ds_list, x_batches, y_batches
+    return train_list, x_train_batches, y_train_batches, x_test_batches, y_test_batches
 
 
-
+@partial(jax.jit, static_argnames=('shuffle_within_batch', 'debug', 'samples_to_check'))
 def shuffle_batches_for_epoch(
-    x_batches: jnp.ndarray,  # (M, K, B, 2)
-    y_batches: jnp.ndarray,  # (M, K, B)
+    x_batches: jnp.ndarray,   # (M, K, B, 2)
+    y_batches: jnp.ndarray,   # (M, K, B)
     epoch: int,
-    seeds: List[int],
+    seeds: jnp.ndarray,       # (M,), dtype=uint32/int32
     shuffle_within_batch: bool = True,
     debug: bool = False,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    samples_to_check: int = 5,   # debug 时每个维度抽多少个 index 做对齐校验
+):
     M, K, B = x_batches.shape[0], x_batches.shape[1], x_batches.shape[2]
 
-    # 1) shuffle batch order (axis=1)
-    perms_k = jnp.stack(
-        [jax.random.permutation(jax.random.fold_in(jax.random.PRNGKey(s), epoch), K)
-         for s in seeds],
-        axis=0
-    )  # (M, K)
+    # --- 1) 打乱 batch 顺序 (axis=1)
+    keys_k  = jax.vmap(lambda s: jax.random.fold_in(jax.random.PRNGKey(s), epoch))(seeds)
+    perms_k = jax.vmap(lambda k: jax.random.permutation(k, K))(keys_k)   # (M, K)
 
-    # use take_along_axis to reorder on axis=1
-    gather_idx_k_x = jnp.broadcast_to(perms_k[:, :, None, None], (M, K, B, 1))
-    gather_idx_k_y = jnp.broadcast_to(perms_k[:, :, None],       (M, K, B))
-    x_shuf = jnp.take_along_axis(x_batches, gather_idx_k_x, axis=1)
-    y_shuf = jnp.take_along_axis(y_batches, gather_idx_k_y, axis=1)
+    gather_k_x = jnp.broadcast_to(perms_k[:, :, None, None], (M, K, B, 1))
+    gather_k_y = jnp.broadcast_to(perms_k[:, :, None],       (M, K, B))
+    x_shuf = jnp.take_along_axis(x_batches, gather_k_x, axis=1)
+    y_shuf = jnp.take_along_axis(y_batches, gather_k_y, axis=1)
 
     if not shuffle_within_batch:
+        # 可选：在 debug 下验证第一步对齐
+        if debug:
+            _debug_check_alignment(x_batches, y_batches, x_shuf, y_shuf,
+                                   perms_k=perms_k, perms_b=None,
+                                   samples_to_check=samples_to_check)
         return x_shuf, y_shuf
 
-    # 2) shuffle samples within each batch (axis=2)
-    perms_b = jnp.stack(
-        [jax.random.permutation(jax.random.fold_in(jax.random.PRNGKey(s ^ 0xBEEF), epoch), B)
-         for s in seeds],
-        axis=0
-    )  # (M, B)
+    # --- 2) 打乱每个 batch 内样本 (axis=2)
+    # 注意 seeds ^ 0xBEEF 时保持无符号类型，避免溢出歧义
+    seeds_b = jnp.bitwise_xor(seeds.astype(jnp.uint32), jnp.uint32(0xBEEF))
+    keys_b  = jax.vmap(lambda s: jax.random.fold_in(jax.random.PRNGKey(s), epoch))(seeds_b)
+    perms_b = jax.vmap(lambda k: jax.random.permutation(k, B))(keys_b)   # (M, B)
 
-    gather_idx_b_x = jnp.broadcast_to(perms_b[:, None, :, None], (M, K, B, 1))
-    gather_idx_b_y = jnp.broadcast_to(perms_b[:, None, :],       (M, K, B))
-    x_shuf = jnp.take_along_axis(x_shuf, gather_idx_b_x, axis=2)
-    y_shuf = jnp.take_along_axis(y_shuf, gather_idx_b_y, axis=2)
+    gather_b_x = jnp.broadcast_to(perms_b[:, None, :, None], (M, K, B, 1))
+    gather_b_y = jnp.broadcast_to(perms_b[:, None, :],       (M, K, B))
+    x_shuf = jnp.take_along_axis(x_shuf, gather_b_x, axis=2)
+    y_shuf = jnp.take_along_axis(y_shuf, gather_b_y, axis=2)
 
     if debug:
-        # sample to check
-        i_samp = [0, min(M-1, 1)]
-        j_samp = [0, min(K-1, 1)]
-        k_samp = [0, min(B-1, 1)]
-
-        pk = np.asarray(perms_k)  
-        pb = np.asarray(perms_b) if perms_b is not None else None
-
-        for i in i_samp:
-            for j in j_samp:
-                for k in k_samp:
-                    # after shuffle (i,j,k) correspond to the original (i, pk[i,j], pb[i,k] or k)
-                    jj = pk[i, j]
-                    kk = pb[i, k] if pb is not None else k
-
-                    x_ref = np.asarray(x_batches[i, jj, kk, :])
-                    y_ref = np.asarray(y_batches[i, jj, kk])
-                    x_now = np.asarray(x_shuf[i, j, k, :])
-                    y_now = np.asarray(y_shuf[i, j, k])
-
-                    assert np.array_equal(x_now, x_ref), f"x mismatch at (i={i}, j={j}, k={k})"
-                    assert y_now == y_ref,               f"y mismatch at (i={i}, j={j}, k={k})"
-        print("[shuffle] debug check passed: x/y still aligned.")
+        _debug_check_alignment(x_batches, y_batches, x_shuf, y_shuf,
+                               perms_k=perms_k, perms_b=perms_b,
+                               samples_to_check=samples_to_check)
 
     return x_shuf, y_shuf
 
-def make_full_eval_grid(p: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Build (|G|^2, 2) inputs and labels for D_n group multiplication."""
-    G, _ = DFT.make_irreps_Dn(p)
-    idx = {g: i for i, g in enumerate(G)}
-    group_size = len(G)
-    x_eval = jnp.array([[idx[g], idx[h]] for g in G for h in G], dtype=jnp.int32)
-    y_eval = jnp.array([idx[dihedral.mult(g, h, p)] for g in G for h in G], dtype=jnp.int32)
-    return x_eval, y_eval  # shapes: (4p^2,2), (4p^2,)
 
-def pad_to_batches(x_eval, y_eval, batch_size: int, num_models: int):
-    """Tile eval to all models and pad to whole batches."""
-    x_exp = jnp.tile(x_eval[None, :, :], (num_models, 1, 1))
-    y_exp = jnp.tile(y_eval[None, :], (num_models, 1))
-    total, bs = x_eval.shape[0], batch_size
-    n_full, remain = total // bs, total % bs
-    if remain > 0:
-        pad = bs - remain
-        x_pad = x_exp[:, :pad, :]
-        y_pad = y_exp[:, :pad]
-        x_eval_padded = jnp.concatenate([x_exp, x_pad], axis=1)
-        y_eval_padded = jnp.concatenate([y_exp, y_pad], axis=1)
-        n_batches = n_full + 1
-    else:
-        x_eval_padded, y_eval_padded, n_batches = x_exp, y_exp, n_full
-    x_batches = x_eval_padded.reshape(num_models, n_batches, bs, 2)
-    y_batches = y_eval_padded.reshape(num_models, n_batches, bs)
-    return x_batches, y_batches
+def _debug_check_alignment(x_in, y_in, x_out, y_out, *, perms_k, perms_b, samples_to_check: int):
+    """
+    仅在 jit 内部调用，纯 JAX 实现对齐校验：
+    检查若干 (i,j,k) 位置：输出 (i,j,k) 等于输入 (i, perms_k[i,j], perms_b[i,k]/k)
+    """
+    # 这些 shape 是编译期常量（来自 .shape），可安全用于 Python range
+    M, K, B = x_in.shape[0], x_in.shape[1], x_in.shape[2]
+    Ii = tuple(range(min(M, samples_to_check)))
+    Jj = tuple(range(min(K, samples_to_check)))
+    Kk = tuple(range(min(B, samples_to_check)))
+
+    ok = jnp.array(True, dtype=jnp.bool_)
+    for i in Ii:
+        for j in Jj:
+            for k in Kk:
+                jj = perms_k[i, j]
+                kk = k if (perms_b is None) else perms_b[i, k]
+
+                x_ref = x_in[i, jj, kk, :]
+                y_ref = y_in[i, jj, kk]
+                x_now = x_out[i, j, k, :]
+                y_now = y_out[i, j, k]
+
+                ok_x = jnp.all(x_ref == x_now)
+                ok_y = jnp.array(y_ref == y_now)
+                ok   = jnp.logical_and(ok, jnp.logical_and(ok_x, ok_y))
+
+    # 打印并在 host 上断言（不会打断 XLA，失败时抛 Python 异常）
+    jax.debug.print("[shuffle] alignment ok? {}", ok)
+
+    def _host_assert(flag):
+        if not bool(flag):
+            raise AssertionError("[shuffle] debug check failed: x/y misaligned.")
+    jax.debug.callback(_host_assert, ok)
 
 # ---------------- TrainState init ----------------
 def create_states(model, tx, weight_decay: float, batch_size: int, random_seed_ints: List[int]):

@@ -6,15 +6,16 @@ import os
 #     os.makedirs(d, exist_ok=True)
 #     return d
 
+# hypertuning
 def base_dir(p: int, mlp_class_lower: str, num_neurons: int, features: int, k: int) -> str:
     d = f"/home/mila/w/weis/scratch/DL/MLP_dihedral/hypertuning/qualitative_{p}_{mlp_class_lower}_{num_neurons}_features_{features}_k_{k}"
     os.makedirs(d, exist_ok=True)
     return d
 
-def model_dir(p: int, batch_size: int, num_neurons: int, weight_decay: float, epochs: int, training_set_size: int,
+def model_dir(p: int, batch_size: int, num_neurons: int, learning_rate: float, weight_decay: float, epochs: int, training_set_size: int,
               base: str, features: int) -> str:
     d = os.path.join(base, f"{p}_models_embed_{features}",
-                     f"p={p}_bs={batch_size}_nn={num_neurons}_wd={weight_decay}_epochs={epochs}_training_set_size={training_set_size}")
+                     f"p={p}_bs={batch_size}_nn={num_neurons}_lr_{learning_rate}_wd={weight_decay}_epochs={epochs}_training_set_size={training_set_size}")
     os.makedirs(d, exist_ok=True)
     return d
 

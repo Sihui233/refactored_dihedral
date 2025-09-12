@@ -9,18 +9,19 @@ import random
 # -----------------------------
 # sweep grid
 # -----------------------------
-# LR_LIST = [1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4, 1e-3, 2e-3]
-# WD_LIST = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
+LR_LIST = [1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4, 1e-3, 2e-3]
+WD_LIST = [1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
+P_LIST = [2 ** 5, 2 ** 9]  
 # P_LIST = [2 ** e for e in range(2, 13)]    # 2^2 ... 2^12
-# NUM_LAYERS_LIST = [1, 2]
-# SEEDS = list(range(10))     
+NUM_LAYERS_LIST = [1, 2]
+SEEDS = list(range(5))     
 
-# test
-LR_LIST = [1e-5]
-WD_LIST = [1e-3]
-P_LIST = [2 ** e for e in range(4, 5)]
-NUM_LAYERS_LIST = [2]
-SEEDS = list(range(1))  
+# # test
+# LR_LIST = [1e-5]
+# WD_LIST = [1e-3]
+# P_LIST = [2 ** e for e in range(4, 5)]
+# NUM_LAYERS_LIST = [2]
+# SEEDS = list(range(1))  
 
 # -----------------------------
 # global variables
@@ -35,7 +36,7 @@ FEATURES = 128
 # Slurm/队列节流设置
 # -----------------------------
 SLURM_SCRIPT = "polynomials_momentum.sh"  # sbatch wrapper
-QUEUE_CAP = 100            
+QUEUE_CAP = 1000            
 SLEEP_WHEN_BUSY = 60       # seconds (too short)
 MAX_SUBMIT_ATTEMPTS = 6    
 INITIAL_BACKOFF = 30       
@@ -62,9 +63,9 @@ def compute_num_neurons(p: int) -> int:
 
 def compute_k(p: int) -> int:
     """
-    k = floor(0.9*p*4)   if p < 2^4
-        floor(0.8*p*4)   if 2^4 <= p < 2^8
-        floor(0.6*p*4)   if p >= 2^8 
+    k = floor(0.9*p*2)   if p < 2^4
+        floor(0.8*p*2)   if 2^4 <= p < 2^8
+        floor(0.6*p*2)   if p >= 2^8 
     """
     # if p < (1 << 4):
     #     frac = 0.9
@@ -73,10 +74,10 @@ def compute_k(p: int) -> int:
     # else:
     #     frac = 0.6
     frac = 0.9
-    return int(frac * p * 4)
+    return int(frac * p * 2)
 
 def batch_size_for_p(p: int) -> int:
-    return p
+    return 2*p
 
 def jobs_in_queue(user: str) -> int:
     """

@@ -1,5 +1,5 @@
 # analysis/while_training_analysis_MLP.py
-from typing import Dict, List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional, Callable, Any
 import jax
 import jax.numpy as jnp
 from controllers.training_prep_MLP import train_epoch, eval_model,shuffle_batches_for_epoch
@@ -11,20 +11,39 @@ def _metrics_to_scalars(m):
     return float(c["loss"]), float(c["l2_loss"]), float(c["accuracy"])
 
 # ---------------- Margins ----------------
-def build_margin_fn(model):
+def build_margin_fn(model, *, chunk_size: int = 8192):
+    """
+    Returns a function margin_stats(params, xs, ys) that computes
+    (min_margin, mean_margin) in small chunks to avoid OOM.
+
+    xs: (N, 2) int32, ys: (N,) int32
+    chunk_size: how many samples per chunk to run through the model.
+    """
     @jax.jit
-    def _margin(params, xs, ys):
-        logits = model.apply({'params': params}, xs, training=False)[0]
-        correct = logits[jnp.arange(xs.shape[0]), ys]
-        masked = jnp.where(jax.nn.one_hot(ys, logits.shape[1], dtype=bool), -1e9, logits)
-        runner = jnp.max(masked, axis=1)
-        margins = correct - runner
-        return jnp.min(margins), jnp.mean(margins)
-    return _margin
+    def _batch_margins(params, xs_chunk, ys_chunk):
+        logits = model.apply({'params': params}, xs_chunk, training=False)[0]  # (b, C)
+        correct = logits[jnp.arange(xs_chunk.shape[0]), ys_chunk]
+        masked  = jnp.where(jax.nn.one_hot(ys_chunk, logits.shape[1], dtype=bool), -1e30, logits)
+        runner  = jnp.max(masked, axis=1)
+        return correct - runner  # (b,)
+
+    def margin_stats(params, xs, ys):
+        N = xs.shape[0]
+        # Use Python loop to avoid building a gigantic HLO / allocation.
+        gmin = jnp.inf
+        total = jnp.array(0.0)
+        for start in range(0, int(N), int(chunk_size)):
+            stop = start + int(chunk_size)
+            m = _batch_margins(params, xs[start:stop], ys[start:stop])  # (b,)
+            gmin = jnp.minimum(gmin, jnp.min(m))
+            total = total + jnp.sum(m)
+        return float(gmin), float(total / N)
+
+    return margin_stats
 
 
 
-# ---------------- Dirichlet energy (MLP) ----------------
+# ---------------- Dirichlet energy (MLP) — low-memory ----------------
 def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
     """
     Build the first-layer input embedding for an MLP model.
@@ -85,25 +104,37 @@ def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
         if in_features == p_guess:
             return (jax.nn.one_hot(a, p_guess) + jax.nn.one_hot(b, p_guess)).astype(jnp.float32)
         raise ValueError("Unsupported first-layer input format.")
-
-def make_energy_funcs_MLP(model, params: dict):
+    
+def make_energy_funcs_MLP(model, params: dict, *, num_probes: int = 1):
     """
-    Returns:
-      emb_fn(x_int)            -> first-layer embedding for a batch: (B, D or 2D)
-      batch_energy_sum(emb_B)  -> sum over batch of ||J||_F^2
-    where f_embed : embedding -> logits, and J = d logits / d embedding.
-    Requires that `model.call_from_embedding(emb, params)` returns (logits, ...).
+    不再构造显式 Jacobian。
+    用 Hutchinson trick：E_v ||J v||^2 = ||J||_F^2，其中 v~N(0, I_D)。
+    这样只用到 JVP，不会产生 (C,D) 的大张量。
     """
     def f_embed(x_embed: jnp.ndarray) -> jnp.ndarray:
         logits, _ = model.call_from_embedding(x_embed, params)
         return logits  # (C,)
 
-    grad_f = jax.jit(jax.jacrev(f_embed))
+    # 单样本 energy：平均 num_probes 次随机方向的 ||J v||^2
+    def _energy_single(x_embed: jnp.ndarray, key: Any) -> jnp.ndarray:
+        def _one_probe(k):
+            v = jax.random.normal(k, x_embed.shape)  # (D,)
+            # jvp 返回 (f(x), J v)，我们只要 J v
+            jv = jax.jvp(f_embed, (x_embed,), (v,))[1]  # (C,)
+            return jnp.vdot(jv, jv)  # ||J v||^2
+
+        keys = jax.random.split(key, num_probes)
+        vals = jax.vmap(_one_probe)(keys)
+        return jnp.mean(vals)
+
+    _energy_single = jax.jit(_energy_single)
 
     @jax.jit
-    def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
-        J = jax.vmap(grad_f)(batch_emb)  # (B, C, D)
-        return jnp.sum(J * J)
+    def batch_energy_sum(batch_emb: jnp.ndarray, key: Any) -> jnp.ndarray:
+        # 为 batch 中每个样本分一个子 key
+        keys = jax.random.split(key, batch_emb.shape[0])
+        energies = jax.vmap(_energy_single)(batch_emb, keys)  # (B,)
+        return jnp.sum(energies)  # Σ ||J||_F^2 (Hutchinson 估计)
 
     def emb_fn(x_data: jnp.ndarray) -> jnp.ndarray:
         return compute_embeddings_MLP(model, params, x_data)
@@ -115,179 +146,285 @@ def compute_dirichlet_energy_embedding_MLP(
     params: dict,
     x_data: jnp.ndarray,           # (N,2)
     *,
-    chunk_size: int = 8192,
+    chunk_size: int = 2048,        # 更保守的缺省
+    num_probes: int = 1,
+    key: Optional[Any] = None,
 ) -> float:
     """
-    Average Dirichlet energy over x_data:
-      (1/N) * Σ_x || d logits(x) / d emb(x) ||_F^2
+    流式计算：不再一次性 materialize 整个 emb。
     """
-    emb_fn, batch_energy_sum = make_energy_funcs_MLP(model, params)
-    emb = emb_fn(x_data)  # (N, D or 2D)
-    N = emb.shape[0]
-    total = 0.0
+    # 复用上面的低内存实现
+    emb_fn, batch_energy_sum = make_energy_funcs_MLP(model, params, num_probes=num_probes)
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    N = x_data.shape[0]
+    total = jnp.array(0.0)
     for s in range(0, N, chunk_size):
-        total += float(batch_energy_sum(emb[s:s+chunk_size]))
-    return total / N
+        e_batch = emb_fn(x_data[s:s + chunk_size])       # (b, D)
+        key, sub = jax.random.split(key)
+        total = total + batch_energy_sum(e_batch, sub)
+    return float(total / N)
 
-def run_epochs(*,
-               model,
-               states,
-               x_batches, y_batches,
-               init_metrics,
-               random_seed_ints: List[int],
-               weight_decay: float,
-               epochs: int,
-               eval_every: int = 1,
-               eval_batches: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
-               eval_flat:    Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
-               eval_fn: Optional[EvalFn] = None,
-               ):
-    assert not (eval_batches is not None and eval_fn is not None), \
-        "Pass either eval_batches or eval_fn, not both."
-    num_models = len(random_seed_ints)
-    margin_fn = build_margin_fn(model) 
+# # # ---------------- Dirichlet energy (MLP) ----------------
+# def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
+#     """
+#     Build the first-layer input embedding for an MLP model.
+#     Tries to infer whether the first layer expects concat/add embeddings or one-hot.
 
-    logs_by_seed: Dict[int, Dict[int, Dict]] = {seed: {} for seed in random_seed_ints}
-    first_100 = {seed: None for seed in random_seed_ints}
-    first_loss = {seed: None for seed in random_seed_ints}
-    first_ce   = {seed: None for seed in random_seed_ints}
+#     x: (B,2) int32 of indices (a,b)
+#     """
+#     a, b = x[:, 0], x[:, 1]
 
-    metrics_template = init_metrics
+#     def _find_first_dense_kernel(params_tree):
+#         for k, v in params_tree.items():
+#             if isinstance(v, dict):
+#                 if "kernel" in v:
+#                     return v["kernel"]
+#                 out = _find_first_dense_kernel(v)
+#                 if out is not None:
+#                     return out
+#         return None
 
-    def _run_eval(current_states):
-        if eval_fn is not None:
-            return eval_fn(current_states)
-        if eval_batches is not None:
-            xe, ye = eval_batches
-            return eval_model(current_states, xe, ye, metrics_template)
-        return None
+#     if hasattr(model, "extract_embeddings_ab"):
+#         Wa, Wb = model.extract_embeddings_ab(params)  # (p, D_a), (p, D_b)
+#         Da, Db = Wa.shape[1], Wb.shape[1]
+#         k0 = _find_first_dense_kernel(params)
+#         if k0 is None:
+#             # Fallback: add embeddings if we cannot infer input size
+#             return Wa[a] + Wb[b]
+#         in_features = k0.shape[0]
+#         p_vocab = Wa.shape[0]
 
-    # Use 10x training batch size as a default chunk size for energy computation
-    energy_chunk = int(x_batches.shape[2]) * 10
-    for epoch in range(epochs):
-        print(f"Epoch {epoch + 1}/{epochs}")
-        # -------- train one epoch --------
-        xb, yb = shuffle_batches_for_epoch(x_batches, y_batches, epoch, random_seed_ints, True,debug=True)
+#         # Concat learned embeddings
+#         if in_features == Da + Db:
+#             return jnp.concatenate([Wa[a], Wb[b]], axis=1)
+#         # Add learned embeddings
+#         if in_features == Da:
+#             return Wa[a] + Wb[b]
+#         # One-hot concat
+#         if in_features == 2 * p_vocab:
+#             return jnp.concatenate(
+#                 [jax.nn.one_hot(a, p_vocab), jax.nn.one_hot(b, p_vocab)], axis=1
+#             ).astype(jnp.float32)
+#         # One-hot addition
+#         if in_features == p_vocab:
+#             return (jax.nn.one_hot(a, p_vocab) + jax.nn.one_hot(b, p_vocab)).astype(jnp.float32)
 
-        # states, train_metrics = train_epoch(states, x_batches, y_batches, metrics_template)
-        states, train_metrics = train_epoch(states, xb, yb, metrics_template)
+#         # Last resort
+#         return Wa[a] + Wb[b]
+#     else:
+#         # No extract_embeddings_ab → assume one-hot style first layer
+#         k0 = _find_first_dense_kernel(params)
+#         if k0 is None:
+#             raise ValueError("Cannot infer first-layer input size for embeddings.")
+#         in_features = k0.shape[0]
+#         p_guess = int(jnp.max(jnp.concatenate([a, b])) + 1)
+#         if in_features == 2 * p_guess:
+#             return jnp.concatenate(
+#                 [jax.nn.one_hot(a, p_guess), jax.nn.one_hot(b, p_guess)], axis=1
+#             ).astype(jnp.float32)
+#         if in_features == p_guess:
+#             return (jax.nn.one_hot(a, p_guess) + jax.nn.one_hot(b, p_guess)).astype(jnp.float32)
+#         raise ValueError("Unsupported first-layer input format.")
 
-        train_losses = []
-        train_accuracies = []
+# def make_energy_funcs_MLP(model, params: dict):
+#     """
+#     Returns:
+#       emb_fn(x_int)            -> first-layer embedding for a batch: (B, D or 2D)
+#       batch_energy_sum(emb_B)  -> sum over batch of ||J||_F^2
+#     where f_embed : embedding -> logits, and J = d logits / d embedding.
+#     Requires that `model.call_from_embedding(emb, params)` returns (logits, ...).
+#     """
+#     def f_embed(x_embed: jnp.ndarray) -> jnp.ndarray:
+#         logits, _ = model.call_from_embedding(x_embed, params)
+#         return logits  # (C,)
 
-        do_eval = (epoch + 1) % eval_every == 0 or (epoch + 1) == epochs
-        te_all = _run_eval(states) if do_eval else None
-        test_losses = [] if do_eval else None
-        test_accuracies = [] if do_eval else None
-        if te_all is not None:
-            print(f"\n--- Test Evaluation at Epoch {epoch + 1} ---")
+#     grad_f = jax.jit(jax.jacrev(f_embed))
 
-        for i in range(num_models):
-            seed = random_seed_ints[i]
-            # Train metrics
-            tm_i = jax.tree_util.tree_map(lambda x: x[i], train_metrics)
-            train_loss, train_l2, train_acc = _metrics_to_scalars(tm_i)
-            logs_by_seed[seed].setdefault(epoch + 1, {})
-            logs_by_seed[seed][epoch + 1].update({
-                "train_loss": train_loss,
-                "train_accuracy": train_acc,
-                "train_ce_loss": train_loss - weight_decay * train_l2,
-            })
-            train_losses.append(train_loss)
-            train_accuracies.append(train_acc)
-            xb_i = xb[i].reshape(-1, 2)
-            yb_i = yb[i].reshape(-1)
-            tr_min_m, tr_avg_m = margin_fn(params_i, xb_i, yb_i)
-            logs_by_seed[seed][epoch + 1].update({
-                "train_margin_min": float(tr_min_m),
-                "train_margin_avg": float(tr_avg_m),
-            })
-            print(f"Seed {seed}: Train Loss: {train_loss:.6f}, Train Accuracy: {train_acc:.2%}")
+#     @jax.jit
+#     def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
+#         J = jax.vmap(grad_f)(batch_emb)  # (B, C, D)
+#         return jnp.sum(J * J)
 
-            # Test metrics
-            if do_eval:
-                te_i = jax.tree_util.tree_map(lambda x: x[i], te_all)
-                test_loss, test_l2, test_acc = _metrics_to_scalars(te_i)
-                test_ce = test_loss - weight_decay * test_l2
-                test_losses.append(test_loss)
-                test_accuracies.append(test_acc)
-                params_i = jax.tree_util.tree_map(lambda x: x[i], states.params)
-                weight_norm = float(
-                    sum(jnp.sum(jnp.square(p)) for p in jax.tree_util.tree_leaves(params_i))
-                )
-                logs_by_seed[seed][epoch + 1].update({
-                    "test_loss": test_loss,
-                    "test_ce_loss": test_ce, 
-                    "test_accuracy": test_acc,
-                    "l2_weight_norm": weight_norm,
-                })
+#     def emb_fn(x_data: jnp.ndarray) -> jnp.ndarray:
+#         return compute_embeddings_MLP(model, params, x_data)
 
-                print(f"Seed {seed}: Test CE Loss: {test_ce:.6f}, Test Total Loss: {test_loss:.6f}, Test Accuracy: {test_acc:.2%}")
-                # margins
-                if eval_flat is not None:
-                    xe_flat, ye_flat = eval_flat              # shapes: (N,2), (N,)
-                    min_m, avg_m = margin_fn(params_i, xe_flat, ye_flat)
-                    xs_eval_for_energy = xe_flat
-                elif eval_batches is not None:
-                    xe_b, ye_b = eval_batches                 # (M, K, B, 2), (M, K, B)
-                    xe_i = xe_b[i].reshape(-1, 2)             
-                    ye_i = ye_b[i].reshape(-1)
-                    # note: eval_batches is from pad_to_batches containing repeated paddings,
-                    # not affecting min_margin, but is gonna affect avg_margin slightly.
-                    min_m, avg_m = margin_fn(params_i, xe_i, ye_i)
-                    xs_eval_for_energy = xe_i
-                else:
-                    min_m, avg_m = jnp.nan, jnp.nan  # if eval grid is none mark as nan
-                    xs_eval_for_energy = None
+#     return emb_fn, batch_energy_sum
 
-                # Dirichlet energies
-                if xs_eval_for_energy is not None:
-                    de_test = compute_dirichlet_energy_embedding_MLP(
-                        model, params_i, xs_eval_for_energy, chunk_size=energy_chunk
-                    )
-                else:
-                    de_test = float("nan")
-                de_train = compute_dirichlet_energy_embedding_MLP(
-                    model, params_i, xb_i, chunk_size=energy_chunk
-                )
-                if xs_eval_for_energy is not None:
-                    x_total = jnp.concatenate([xs_eval_for_energy, xb_i], axis=0)
-                    de_total = compute_dirichlet_energy_embedding_MLP(
-                        model, params_i, x_total, chunk_size=energy_chunk
-                    )
-                else:
-                    de_total = de_train
+# def compute_dirichlet_energy_embedding_MLP(
+#     model,
+#     params: dict,
+#     x_data: jnp.ndarray,           # (N,2)
+#     *,
+#     chunk_size: int = 8192,
+# ) -> float:
+#     """
+#     Average Dirichlet energy over x_data:
+#       (1/N) * Σ_x || d logits(x) / d emb(x) ||_F^2
+#     """
+#     emb_fn, batch_energy_sum = make_energy_funcs_MLP(model, params)
+#     emb = emb_fn(x_data)  # (N, D or 2D)
+#     N = emb.shape[0]
+#     total = 0.0
+#     for s in range(0, N, chunk_size):
+#         total += float(batch_energy_sum(emb[s:s+chunk_size]))
+#     return total / N
 
-                logs_by_seed[seed][epoch + 1].update({
-                    "test_loss": test_loss,
-                    "test_ce_loss": test_ce,
-                    "test_accuracy": test_acc,
-                    "l2_weight_norm": weight_norm,
-                    "test_margin_min": float(min_m),
-                    "test_margin_avg": float(avg_m),
-                    "dirichlet_energy_test":  float(de_test),
-                    "dirichlet_energy_train": float(de_train),
-                    "dirichlet_energy_total": float(de_total),
-                })
-                print(
-                    f"Seed {seed}: Test CE {test_ce:.6f}, Total {test_loss:.6f}, "
-                    f"Acc {test_acc:.2%}, "
-                    f"Margin[min/avg] {float(min_m):.4f}/{float(avg_m):.4f}, "
-                    f"DE[test/train/total] {de_test:.3e}/{de_train:.3e}/{de_total:.3e}"
-                )
-                if first_100[seed] is None and test_acc >= 1.0:
-                    first_100[seed] = epoch + 1
-                    first_loss[seed] = test_loss
-                    first_ce[seed]   = test_ce
-                    logs_by_seed[seed][epoch + 1]["first_reach_100%"] = epoch + 1
-                    print(
-                        f"*** Seed {seed} first reached 100% accuracy at epoch {epoch + 1} "
-                        f"with total loss {test_loss:.6f} and CE-only loss {test_ce:.6f} ***"
-                    )
+# def run_epochs(*,
+#                model,
+#                states,
+#                x_batches, y_batches,
+#                init_metrics,
+#                random_seed_ints: List[int],
+#                weight_decay: float,
+#                epochs: int,
+#                eval_every: int = 1,
+#                eval_batches: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
+#                eval_flat:    Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
+#                eval_fn: Optional[EvalFn] = None,
+#                ):
+#     assert not (eval_batches is not None and eval_fn is not None), \
+#         "Pass either eval_batches or eval_fn, not both."
+#     num_models = len(random_seed_ints)
+#     margin_fn = build_margin_fn(model) 
+
+#     logs_by_seed: Dict[int, Dict[int, Dict]] = {seed: {} for seed in random_seed_ints}
+#     first_100 = {seed: None for seed in random_seed_ints}
+#     first_loss = {seed: None for seed in random_seed_ints}
+#     first_ce   = {seed: None for seed in random_seed_ints}
+
+#     metrics_template = init_metrics
+
+#     def _run_eval(current_states):
+#         if eval_fn is not None:
+#             return eval_fn(current_states)
+#         if eval_batches is not None:
+#             xe, ye = eval_batches
+#             return eval_model(current_states, xe, ye, metrics_template)
+#         return None
+
+#     # Use 10x training batch size as a default chunk size for energy computation
+#     energy_chunk = int(min(2048, x_batches.shape[2] * 2))
+#     for epoch in range(epochs):
+#         print(f"Epoch {epoch + 1}/{epochs}")
+#         # -------- train one epoch --------
+#         xb, yb = shuffle_batches_for_epoch(x_batches, y_batches, epoch, random_seed_ints, True,debug=False)
+
+#         # states, train_metrics = train_epoch(states, x_batches, y_batches, metrics_template)
+#         states, train_metrics = train_epoch(states, xb, yb, metrics_template)
+
+#         train_losses = []
+#         train_accuracies = []
+
+#         do_eval = (epoch + 1) % eval_every == 0 
+#         te_all = _run_eval(states) if do_eval else None
+#         test_losses = [] if do_eval else None
+#         test_accuracies = [] if do_eval else None
+#         if te_all is not None:
+#             print(f"\n--- Test Evaluation at Epoch {epoch + 1} ---")
+
+#         for i in range(num_models):
+#             seed = random_seed_ints[i]
+#             # Train metrics
+#             tm_i = jax.tree_util.tree_map(lambda x: x[i], train_metrics)
+#             train_loss, train_l2, train_acc = _metrics_to_scalars(tm_i)
+#             logs_by_seed[seed].setdefault(epoch + 1, {})
+#             logs_by_seed[seed][epoch + 1].update({
+#                 "train_loss": train_loss,
+#                 "train_accuracy": train_acc,
+#                 "train_ce_loss": train_loss - weight_decay * train_l2,
+#             })
+#             train_losses.append(train_loss)
+#             train_accuracies.append(train_acc)
+
+#             print(f"Seed {seed}: Train Loss: {train_loss:.6f}, Train Accuracy: {train_acc:.2%}")
+
+#             # Test metrics
+#             if do_eval or (epoch + 1) == epochs:
+#                 te_i = jax.tree_util.tree_map(lambda x: x[i], te_all)
+#                 test_loss, test_l2, test_acc = _metrics_to_scalars(te_i)
+#                 test_ce = test_loss - weight_decay * test_l2
+#                 test_losses.append(test_loss)
+#                 test_accuracies.append(test_acc)
+#                 params_i = jax.tree_util.tree_map(lambda x: x[i], states.params)
+#                 weight_norm = float(
+#                     sum(jnp.sum(jnp.square(p)) for p in jax.tree_util.tree_leaves(params_i))
+#                 )
+#                 logs_by_seed[seed][epoch + 1].update({
+#                     "test_loss": test_loss,
+#                     "test_ce_loss": test_ce, 
+#                     "test_accuracy": test_acc,
+#                     "l2_weight_norm": weight_norm,
+#                 })
+
+#                 xb_i = xb[i].reshape(-1, 2)
+#                 yb_i = yb[i].reshape(-1)
+#                 tr_min_m, tr_avg_m = margin_fn(params_i, xb_i, yb_i)
+#                 logs_by_seed[seed][epoch + 1].update({
+#                     "train_margin_min": float(tr_min_m),
+#                     "train_margin_avg": float(tr_avg_m),
+#                 })
+
+#                 print(f"Seed {seed}: Test CE Loss: {test_ce:.6f}, Test Total Loss: {test_loss:.6f}, Test Accuracy: {test_acc:.2%}")
+#                 # eval margins
+#                 if eval_flat is not None:
+#                     xe_flat, ye_flat = eval_flat              # shapes: (N,2), (N,)
+#                     min_m, avg_m = margin_fn(params_i, xe_flat, ye_flat)
+#                     xs_eval_for_energy = xe_flat
+#                 elif eval_batches is not None:
+#                     xe_b, ye_b = eval_batches                 # (M, K, B, 2), (M, K, B)
+#                     xe_i = xe_b[i].reshape(-1, 2)             
+#                     ye_i = ye_b[i].reshape(-1)
+#                     # note: eval_batches is from pad_to_batches containing repeated paddings,
+#                     # not affecting min_margin, but is gonna affect avg_margin slightly.
+#                     min_m, avg_m = margin_fn(params_i, xe_i, ye_i)
+#                     xs_eval_for_energy = xe_i
+#                 else:
+#                     min_m, avg_m = jnp.nan, jnp.nan  # if eval grid is none mark as nan
+#                     xs_eval_for_energy = None
+
+#                 # Dirichlet energies
+#                 if xs_eval_for_energy is not None:
+#                     de_test = compute_dirichlet_energy_embedding_MLP(
+#                         model, params_i, xs_eval_for_energy, chunk_size=energy_chunk
+#                     )
+#                 else:
+#                     de_test = float("nan")
+#                 de_train = compute_dirichlet_energy_embedding_MLP(
+#                     model, params_i, xb_i, chunk_size=energy_chunk
+#                 )
+                
+
+#                 logs_by_seed[seed][epoch + 1].update({
+#                     "test_loss": test_loss,
+#                     "test_ce_loss": test_ce,
+#                     "test_accuracy": test_acc,
+#                     "l2_weight_norm": weight_norm,
+#                     "test_margin_min": float(min_m),
+#                     "test_margin_avg": float(avg_m),
+#                     "dirichlet_energy_test":  float(de_test),
+#                     "dirichlet_energy_train": float(de_train),
+#                 })
+#                 print(
+#                     f"Seed {seed}: Test CE {test_ce:.6f}, Total {test_loss:.6f}, "
+#                     f"Acc {test_acc:.2%}, "
+#                     f"Margin[min/avg] {float(min_m):.4f}/{float(avg_m):.4f}, "
+#                     f"DE[test/train/total] {de_test:.3e}/{de_train:.3e}"
+#                 )
+#                 if first_100[seed] is None and test_acc >= 1.0:
+#                     first_100[seed] = epoch + 1
+#                     first_loss[seed] = test_loss
+#                     first_ce[seed]   = test_ce
+#                     logs_by_seed[seed][epoch + 1]["first_reach_100%"] = epoch + 1
+#                     print(
+#                         f"*** Seed {seed} first reached 100% accuracy at epoch {epoch + 1} "
+#                         f"with total loss {test_loss:.6f} and CE-only loss {test_ce:.6f} ***"
+#                     )
                     
                 
                 
-    return states, logs_by_seed, first_100, first_loss, first_ce
+#     return states, logs_by_seed, first_100, first_loss, first_ce
 
 def run_epochs_scaling(*,
                        model,
@@ -303,7 +440,7 @@ def run_epochs_scaling(*,
                        eval_fn: Optional[EvalFn] = None,
                        ):
     """
-    Same as run_epochs, but structured for your scaling experiments.
+    Same as run_epochs, but structured for scaling experiments.
     Also logs margins and Dirichlet energy at evaluation points.
     """
     assert not (eval_batches is not None and eval_fn is not None), \
@@ -325,27 +462,36 @@ def run_epochs_scaling(*,
             return eval_model(current_states, xe, ye, metrics_template)
         return None
 
-    energy_chunk = int(x_batches.shape[2]) * 10
+    seeds_arr = jnp.asarray(random_seed_ints, dtype=jnp.uint32)
+    energy_chunk = int(min(2048, x_batches.shape[2] * 2))
 
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
-        xb, yb = shuffle_batches_for_epoch(
-            x_batches, y_batches, epoch, random_seed_ints, True, debug=False
-        )
+
+        xb, yb = shuffle_batches_for_epoch(x_batches, y_batches, epoch, seeds_arr,
+                                        shuffle_within_batch=True, debug=False)
+
         states, train_metrics = train_epoch(states, xb, yb, metrics_template)
 
-        do_eval = (epoch + 1) % eval_every == 0 or (epoch + 1) == epochs
+        do_eval = (epoch + 1) % eval_every == 0
         te_all = _run_eval(states) if do_eval else None
+
+        jax.block_until_ready(states)
+
         if te_all is not None:
             print(f"\n--- Test Evaluation at Epoch {epoch + 1} ---")
 
         for i in range(num_models):
             seed = random_seed_ints[i]
+
+            if (first_100[seed] is not None) and ((epoch + 1) != epochs):
+                continue
+
             tm_i = jax.tree_util.tree_map(lambda x: x[i], train_metrics)
             train_loss, train_l2, train_acc = _metrics_to_scalars(tm_i)
             print(f"Seed {seed}: Train Loss: {train_loss:.6f}, Train Accuracy: {train_acc:.2%}")
 
-            if do_eval:
+            if do_eval or (epoch + 1) == epochs:
                 te_i = jax.tree_util.tree_map(lambda x: x[i], te_all)
                 test_loss, test_l2, test_acc = _metrics_to_scalars(te_i)
                 test_ce = test_loss - weight_decay * test_l2
@@ -384,13 +530,7 @@ def run_epochs_scaling(*,
                 de_train = compute_dirichlet_energy_embedding_MLP(
                     model, params_i, xb_i, chunk_size=energy_chunk
                 )
-                if xs_eval_for_energy is not None:
-                    x_total = jnp.concatenate([xs_eval_for_energy, xb_i], axis=0)
-                    de_total = compute_dirichlet_energy_embedding_MLP(
-                        model, params_i, x_total, chunk_size=energy_chunk
-                    )
-                else:
-                    de_total = de_train
+                
 
                 logs_by_seed[seed].setdefault(epoch + 1, {})
                 logs_by_seed[seed][epoch + 1].update({
@@ -407,14 +547,13 @@ def run_epochs_scaling(*,
                     "test_margin_avg": float(avg_m),
                     "dirichlet_energy_test":  float(de_test),
                     "dirichlet_energy_train": float(de_train),
-                    "dirichlet_energy_total": float(de_total),
                 })
 
                 print(
                     f"Seed {seed}: Test CE {test_ce:.6f}, Total {test_loss:.6f}, "
                     f"Acc {test_acc:.2%}, "
                     f"Margin[min/avg] {float(min_m):.4f}/{float(avg_m):.4f}, "
-                    f"DE[test/train/total] {de_test:.3e}/{de_train:.3e}/{de_total:.3e}"
+                    f"DE[test/train/total] {de_test:.3e}/{de_train:.3e}"
                 )
 
                 if first_100[seed] is None and test_acc >= 1.0:
@@ -468,77 +607,100 @@ def compute_embeddings_transformer(
     else:
         return emb_a + emb_b                                     # (B , D)
 
-# 2)  make_energy_funcs_transformer
-def make_energy_funcs_transformer(
-    model,           # the *initialised* model instance
-    params: dict,                   # its parameters
-    *,
-    concat: bool = False,
-):
-    """
-    Returns two callables **emb_fn** and **batch_energy_sum** that exactly
-    mirror the MLP helpers:
+# # 2)  make_energy_funcs_transformer
+# def make_energy_funcs_transformer(
+#     model,           # the *initialised* model instance
+#     params: dict,                   # its parameters
+#     *,
+#     concat: bool = False,
+# ):
+#     """
+#     Returns two callables **emb_fn** and **batch_energy_sum** that exactly
+#     mirror the MLP helpers:
 
-    • emb_fn(x_int)              →  embedding batch  (see above)
-    • batch_energy_sum(e_batch)  →  Σ ‖J‖²_F  over that *batch*
+#     • emb_fn(x_int)              →  embedding batch  (see above)
+#     • batch_energy_sum(e_batch)  →  Σ ‖J‖²_F  over that *batch*
 
-    where J is the Jacobian  ∂ logits / ∂ embedding.
-    """
+#     where J is the Jacobian  ∂ logits / ∂ embedding.
+#     """
 
-    # ---------- f_embed : (D,) or (2D,)  →  (p,) logits ----------------------
-    Wa, _ = model.extract_embeddings_ab(params)
-    D = Wa.shape[1]
+#     # ---------- f_embed : (D,) or (2D,)  →  (p,) logits ----------------------
+#     Wa, _ = model.extract_embeddings_ab(params)
+#     D = Wa.shape[1]
 
-    def _to_seq(x_flat: jnp.ndarray) -> jnp.ndarray:
-        if concat:
-            ea, eb = jnp.split(x_flat, 2)
-        else:
-            ea = x_flat * 0.5
-            eb = x_flat * 0.5
-        return jnp.stack([ea, eb])[None, ...]             # (1, 2, D)
+#     def _to_seq(x_flat: jnp.ndarray) -> jnp.ndarray:
+#         if concat:
+#             ea, eb = jnp.split(x_flat, 2)
+#         else:
+#             ea = x_flat * 0.5
+#             eb = x_flat * 0.5
+#         return jnp.stack([ea, eb])[None, ...]             # (1, 2, D)
 
-    def f_embed(x_flat: jnp.ndarray) -> jnp.ndarray:      # → (p,)
-        seq_emb = _to_seq(x_flat)                         # (1, 2, D)
-        logits  = model.call_from_embedding_sequence(seq_emb, params)[0]
-        return logits[-1]                                  # last-token logits
+#     def f_embed(x_flat: jnp.ndarray) -> jnp.ndarray:      # → (p,)
+#         seq_emb = _to_seq(x_flat)                         # (1, 2, D)
+#         logits  = model.call_from_embedding_sequence(seq_emb, params)[0]
+#         return logits[-1]                                  # last-token logits
 
-    f_embed = jax.jit(f_embed)
+#     f_embed = jax.jit(f_embed)
 
-    def _squared_frobenius_norm_of_jac(x_flat: jnp.ndarray) -> jnp.ndarray:
-        J = jax.jacrev(f_embed)(x_flat)                   # (p, D | 2D)
-        return jnp.sum(J * J)
+#     def _squared_frobenius_norm_of_jac(x_flat: jnp.ndarray) -> jnp.ndarray:
+#         J = jax.jacrev(f_embed)(x_flat)                   # (p, D | 2D)
+#         return jnp.sum(J * J)
 
-    _squared_frobenius_norm_of_jac = jax.jit(_squared_frobenius_norm_of_jac)
+#     _squared_frobenius_norm_of_jac = jax.jit(_squared_frobenius_norm_of_jac)
 
-    emb_fn = partial(compute_embeddings_transformer, model, params, concat=concat)
+#     emb_fn = partial(compute_embeddings_transformer, model, params, concat=concat)
 
-    def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
-        return jax.vmap(_squared_frobenius_norm_of_jac)(batch_emb).sum()
+#     def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
+#         return jax.vmap(_squared_frobenius_norm_of_jac)(batch_emb).sum()
 
-    return emb_fn, batch_energy_sum
+#     return emb_fn, batch_energy_sum
 
-# 3)  driver that averages over an arbitrary input set
-def compute_dirichlet_energy_embedding_transformer(
-    model,
-    params: dict,
-    x_data: jnp.ndarray,                 # (N , 2)  all (a , b) pairs of interest
-    *,
-    batch_size: int = 1024,
-    concat: bool = False,
-) -> float:
-    """
-    Plain (non-JIT) wrapper that chunks `x_data` to keep memory modest.
-    """
-    emb_fn, batch_energy_sum = make_energy_funcs_transformer(
-        model, params, concat=concat
-    )
+# # 3)  driver that averages over an arbitrary input set
+# def compute_dirichlet_energy_embedding_transformer(
+#     model,
+#     params: dict,
+#     x_data: jnp.ndarray,                 # (N , 2)  all (a , b) pairs of interest
+#     *,
+#     batch_size: int = 1024,
+#     concat: bool = False,
+# ) -> float:
+#     """
+#     Plain (non-JIT) wrapper that chunks `x_data` to keep memory modest.
+#     """
+#     emb_fn, batch_energy_sum = make_energy_funcs_transformer(
+#         model, params, concat=concat
+#     )
 
-    total = 0.0
-    n     = x_data.shape[0]
+#     total = 0.0
+#     n     = x_data.shape[0]
 
-    for i in range(0, n, batch_size):
-        x_batch   = x_data[i : i + batch_size]
-        e_batch   = emb_fn(x_batch)                       # (B , D | 2D)
-        total    += batch_energy_sum(e_batch)
+#     for i in range(0, n, batch_size):
+#         x_batch   = x_data[i : i + batch_size]
+#         e_batch   = emb_fn(x_batch)                       # (B , D | 2D)
+#         total    += batch_energy_sum(e_batch)
 
-    return float(total / n)
+#     return float(total / n)
+
+# def make_energy_funcs_transformer(..., num_probes=1, concat=False):
+#     def f_embed(x_flat):
+#         seq = _to_seq(x_flat)              # (1, 2, D)
+#         logits = model.call_from_embedding_sequence(seq, params)[0]
+#         return logits[-1]                   # (C,)
+
+#     @jax.jit
+#     def _energy_single(x_flat, key):
+#         def _one_probe(k):
+#             v = jax.random.normal(k, x_flat.shape)
+#             jv = jax.jvp(f_embed, (x_flat,), (v,))[1]
+#             return jnp.vdot(jv, jv)
+#         keys = jax.random.split(key, num_probes)
+#         return jnp.mean(jax.vmap(_one_probe)(keys))
+
+#     @jax.jit
+#     def batch_energy_sum(batch_emb, key):
+#         keys = jax.random.split(key, batch_emb.shape[0])
+#         return jax.vmap(_energy_single)(batch_emb, keys).sum()
+
+#     emb_fn = partial(compute_embeddings_transformer, model, params, concat=concat)
+#     return emb_fn, batch_energy_sum

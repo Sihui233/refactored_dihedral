@@ -26,26 +26,219 @@ def idx_mul(i: int, j: int, G, idx, p: int) -> int:
     g, h = G[i], G[j]
     return idx[mult(g, h, p)]
 
-def make_dihedral_dataset(p, batch_size, num_batches, seed):
-    # enumerate D_n elements
-    G = [('rot',i) for i in range(p)] + [('ref',i) for i in range(p)]
-    idx = {g:i for i,g in enumerate(G)}
-    total = num_batches * batch_size
-    # all pairs and labels
-    pairs = []
-    labels = []
-    for g in G:
-        for h in G:
-            pairs.append((idx[g], idx[h]))
-            labels.append(idx[mult(g,h,p)])
-    # shuffle and batch
+# def make_dihedral_dataset(p, batch_size, num_batches, seed):
+#     # enumerate D_n elements
+#     G = [('rot',i) for i in range(p)] + [('ref',i) for i in range(p)]
+#     idx = {g:i for i,g in enumerate(G)}
+#     total = num_batches * batch_size
+#     # all pairs and labels
+#     pairs = []
+#     labels = []
+#     for g in G:
+#         for h in G:
+#             pairs.append((idx[g], idx[h]))
+#             labels.append(idx[mult(g,h,p)])
+#     # shuffle and batch
+#     key = jax.random.PRNGKey(seed)
+#     perm = jax.random.permutation(key, len(pairs))[:total]
+#     arr = jnp.array(pairs)[perm]
+#     lbl = jnp.array(labels)[perm]
+#     arr = arr.reshape(num_batches, batch_size, 2)
+#     lbl = lbl.reshape(num_batches, batch_size)
+#     return arr, lbl
+
+def make_dihedral_dataset_with_test(
+    p: int,
+    batch_size: int,
+    num_batches: int,
+    seed: int,
+    *,
+    test_batch_size: int | None = None,
+    shuffle_test: bool = True,
+    drop_remainder: bool = True,
+):
+    """
+    Returns:
+      x_train: (num_batches, batch_size, 2)
+      y_train: (num_batches, batch_size)
+      x_test_batches: (K_test, B_test, 2)   # complement of train, batched
+      y_test_batches: (K_test, B_test)
+
+    Train is sampled uniformly from the full G×G; test is the complement.
+    Test batching defaults to the same batch_size unless test_batch_size is given.
+    By default we drop incomplete last test batch (no padding bias).
+    """
+    # Enumerate D_n elements
+    G = [('rot', i) for i in range(p)] + [('ref', i) for i in range(p)]
+    idx = {g: i for i, g in enumerate(G)}
+
+    total_train = num_batches * batch_size
+    group_size = len(G)
+    total_pairs = group_size * group_size  # |G|^2
+
+    if total_train >= total_pairs:
+        raise ValueError(
+            f"Train size {total_train} >= total pairs {total_pairs}; "
+            "no room left for a test split."
+        )
+
+    # Build full pairs and labels (numpy for cheap masking/shuffling)
+    pairs = np.array([(idx[g], idx[h]) for g in G for h in G], dtype=np.int32)
+    labels = np.array([idx[mult(g, h, p)] for g in G for h in G], dtype=np.int32)
+
+    # Sample train indices with JAX RNG to match your original code
     key = jax.random.PRNGKey(seed)
-    perm = jax.random.permutation(key, len(pairs))[:total]
-    arr = jnp.array(pairs)[perm]
-    lbl = jnp.array(labels)[perm]
-    arr = arr.reshape(num_batches, batch_size, 2)
-    lbl = lbl.reshape(num_batches, batch_size)
-    return arr, lbl
+    perm = np.array(jax.random.permutation(key, total_pairs))  # np array for indexing
+
+    train_idx = perm[:total_train]
+    x_train = jnp.array(pairs[train_idx]).reshape(num_batches, batch_size, 2)
+    y_train = jnp.array(labels[train_idx]).reshape(num_batches, batch_size)
+
+    # Complement = test indices
+    mask = np.ones(total_pairs, dtype=bool)
+    mask[train_idx] = False
+    test_idx = np.nonzero(mask)[0]
+
+    # Shuffle test set (numpy RNG for speed; seed separated from train)
+    if shuffle_test:
+        rng = np.random.default_rng(seed ^ 0xBEEF)
+        rng.shuffle(test_idx)
+
+    # Batch test
+    B_test = int(test_batch_size) if test_batch_size is not None else int(batch_size)
+    if drop_remainder:
+        K_test = len(test_idx) // B_test
+        use = test_idx[: K_test * B_test]
+        x_test_batches = jnp.array(pairs[use].reshape(K_test, B_test, 2))
+        y_test_batches = jnp.array(labels[use].reshape(K_test, B_test))
+    else:
+        # Pad to full batch using a small wrap-around (no effect on class balance for large sets)
+        rem = len(test_idx) % B_test
+        if rem == 0:
+            use = test_idx
+        else:
+            pad = B_test - rem
+            pad_idx = np.concatenate([test_idx, test_idx[:pad]], axis=0)
+            use = pad_idx
+        K_test = len(use) // B_test
+        x_test_batches = jnp.array(pairs[use].reshape(K_test, B_test, 2))
+        y_test_batches = jnp.array(labels[use].reshape(K_test, B_test))
+
+    x_flat = np.asarray(x_test_batches).reshape(-1, 2)
+    y_flat = np.asarray(y_test_batches).reshape(-1)
+
+    y_from_x = np.array([idx_mul(i, j, G, idx, p) for i, j in x_flat], dtype=np.int32)
+    assert np.array_equal(y_flat, y_from_x), "Mismatch: some (x,y) in test are misaligned"
+
+    # disjoint verification
+    train_pairs = np.asarray(x_train).reshape(-1, 2)
+    test_pairs  = np.asarray(x_test_batches).reshape(-1, 2)
+    train_set = set(map(tuple, train_pairs))
+    test_set  = set(map(tuple, test_pairs))
+    assert train_set.isdisjoint(test_set), "Train and test are not disjoint!"
+
+    return x_train, y_train, x_test_batches, y_test_batches
+
+# def make_dihedral_dataset_with_test(
+#     p: int,
+#     batch_size: int,
+#     num_batches: int,
+#     seed: int,
+#     *,
+#     test_batch_size: int | None = None,
+#     shuffle_test: bool = True,
+#     drop_remainder: bool = False,
+# ):
+#     """
+#     Returns:
+#       x_train: (num_batches, batch_size, 2)
+#       y_train: (num_batches, batch_size)
+#       x_test_batches: (K_test, B_test, 2)
+#       y_test_batches: (K_test, B_test)
+
+#     default：train samples from G×G, test = complement
+#     edge case：if train covers  full G×G, test is also full G×G
+#     """
+#     # Enumerate D_n elements
+#     G = [('rot', i) for i in range(p)] + [('ref', i) for i in range(p)]
+#     idx = {g: i for i, g in enumerate(G)}
+
+#     group_size = len(G)
+#     total_pairs = group_size * group_size  # |G|^2
+#     total_train = num_batches * batch_size
+
+#     # Build full pairs and labels (numpy for cheap masking/shuffling)
+#     pairs = np.array([(idx[g], idx[h]) for g in G for h in G], dtype=np.int32)
+#     labels = np.array([idx[mult(g, h, p)] for g in G for h in G], dtype=np.int32)
+
+#     # JAX RNG for reproducible train sampling
+#     key = jax.random.PRNGKey(seed)
+#     perm = np.array(jax.random.permutation(key, total_pairs))  # np array for indexing
+
+#     if total_train > total_pairs:
+#         
+#         raise ValueError(
+#             f"Train size {total_train} > total pairs {total_pairs}; cannot fill train without repeats."
+#         )
+
+#     test_is_full = (total_train == total_pairs)
+
+#     # ------ Train indices ------
+#     train_idx = perm[:total_train]
+#     x_train = jnp.array(pairs[train_idx]).reshape(num_batches, batch_size, 2)
+#     y_train = jnp.array(labels[train_idx]).reshape(num_batches, batch_size)
+
+#     # ------ Test indices ------
+#     if test_is_full:
+#         # test set = full dataset
+#         test_idx = np.arange(total_pairs, dtype=np.int32)
+#         if shuffle_test:
+#             rng = np.random.default_rng(seed ^ 0xBEEF)
+#             rng.shuffle(test_idx)
+#     else:
+#         # test set = complement of train set
+#         mask = np.ones(total_pairs, dtype=bool)
+#         mask[train_idx] = False
+#         test_idx = np.nonzero(mask)[0]
+#         if shuffle_test:
+#             rng = np.random.default_rng(seed ^ 0xBEEF)
+#             rng.shuffle(test_idx)
+
+#     # ------ Batch test ------
+#     B_test = int(test_batch_size) if test_batch_size is not None else int(batch_size)
+#     if drop_remainder:
+#         K_test = len(test_idx) // B_test
+#         use = test_idx[: K_test * B_test]
+#         x_test_batches = jnp.array(pairs[use].reshape(K_test, B_test, 2))
+#         y_test_batches = jnp.array(labels[use].reshape(K_test, B_test))
+#     else:
+#         rem = len(test_idx) % B_test
+#         if rem == 0:
+#             use = test_idx
+#         else:
+#             pad = B_test - rem
+#             pad_idx = np.concatenate([test_idx, test_idx[:pad]], axis=0)
+#             use = pad_idx
+#         K_test = len(use) // B_test
+#         x_test_batches = jnp.array(pairs[use].reshape(K_test, B_test, 2))
+#         y_test_batches = jnp.array(labels[use].reshape(K_test, B_test))
+
+#     # ------ Sanity checks ------
+#     # match check
+#     x_flat = np.asarray(x_test_batches).reshape(-1, 2)
+#     y_flat = np.asarray(y_test_batches).reshape(-1)
+#     y_from_x = np.array([idx_mul(i, j, G, idx, p) for i, j in x_flat], dtype=np.int32)
+#     assert np.array_equal(y_flat, y_from_x), "Mismatch: some (x,y) in test are misaligned"
+
+#     # check disjoint or not only when test is the complement of train set
+#     if not test_is_full:
+#         train_pairs = np.asarray(x_train).reshape(-1, 2)
+#         test_pairs  = np.asarray(x_test_batches).reshape(-1, 2)
+#         train_set = set(map(tuple, train_pairs))
+#         test_set  = set(map(tuple, test_pairs))
+#         assert train_set.isdisjoint(test_set), "Train and test are not disjoint!"
+
+#     return x_train, y_train, x_test_batches, y_test_batches
 
 def check_representation_consistency(G, R, mult, p, tol=1e-6):
     for g in G:
