@@ -3,8 +3,9 @@ from typing import Dict, List, Tuple, Optional, Callable, Any
 import jax
 import jax.numpy as jnp
 from controllers.training_prep_MLP import train_epoch, eval_model,shuffle_batches_for_epoch
+from functools import partial
 
-EvalFn = Callable[[any], any]  # eval_fn(states) -> metrics collection (per-model)
+EvalFn = Callable[[Any], Any]  # eval_fn(states) -> metrics collection (per-model)
 
 def _metrics_to_scalars(m):
     c = m.compute()
@@ -21,7 +22,11 @@ def build_margin_fn(model, *, chunk_size: int = 8192):
     """
     @jax.jit
     def _batch_margins(params, xs_chunk, ys_chunk):
-        logits = model.apply({'params': params}, xs_chunk, training=False)[0]  # (b, C)
+        out = model.apply({'params': params}, xs_chunk, training=False)
+        logits = out[0] if isinstance(out, (tuple, list)) else out
+        # comaptible w transformer
+        if logits.ndim == 3:  
+            logits = logits[:, -1, :]   # (B,C)
         correct = logits[jnp.arange(xs_chunk.shape[0]), ys_chunk]
         masked  = jnp.where(jax.nn.one_hot(ys_chunk, logits.shape[1], dtype=bool), -1e30, logits)
         runner  = jnp.max(masked, axis=1)
@@ -43,7 +48,152 @@ def build_margin_fn(model, *, chunk_size: int = 8192):
 
 
 
-# ---------------- Dirichlet energy (MLP) — low-memory ----------------
+# # ---------------- Dirichlet energy (MLP) — low-memory ----------------
+# def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
+#     """
+#     Build the first-layer input embedding for an MLP model.
+#     Tries to infer whether the first layer expects concat/add embeddings or one-hot.
+
+#     x: (B,2) int32 of indices (a,b)
+#     """
+#     a, b = x[:, 0], x[:, 1]
+
+#     def _find_first_dense_kernel(params_tree):
+#         for k, v in params_tree.items():
+#             if isinstance(v, dict):
+#                 if "kernel" in v:
+#                     return v["kernel"]
+#                 out = _find_first_dense_kernel(v)
+#                 if out is not None:
+#                     return out
+#         return None
+
+#     if hasattr(model, "extract_embeddings_ab"):
+#         Wa, Wb = model.extract_embeddings_ab(params)  # (group_size, D_a), (group_size, D_b)
+#         Da, Db = Wa.shape[1], Wb.shape[1]
+#         k0 = _find_first_dense_kernel(params)
+#         if k0 is None:
+#             # Fallback: add embeddings if we cannot infer input size
+#             return Wa[a] + Wb[b]
+#         in_features = k0.shape[0]
+#         p_vocab = Wa.shape[0]
+
+#         # Concat learned embeddings
+#         if in_features == Da + Db:
+#             return jnp.concatenate([Wa[a], Wb[b]], axis=1)
+#         # Add learned embeddings
+#         if in_features == Da:
+#             return Wa[a] + Wb[b]
+#         # One-hot concat
+#         if in_features == 2 * p_vocab:
+#             return jnp.concatenate(
+#                 [jax.nn.one_hot(a, p_vocab), jax.nn.one_hot(b, p_vocab)], axis=1
+#             ).astype(jnp.float32)
+#         # One-hot addition
+#         if in_features == p_vocab:
+#             return (jax.nn.one_hot(a, p_vocab) + jax.nn.one_hot(b, p_vocab)).astype(jnp.float32)
+
+#         # Last resort
+#         return Wa[a] + Wb[b]
+#     else:
+#         # No extract_embeddings_ab → assume one-hot style first layer
+#         k0 = _find_first_dense_kernel(params)
+#         if k0 is None:
+#             raise ValueError("Cannot infer first-layer input size for embeddings.")
+#         in_features = k0.shape[0]
+#         p_guess = int(jnp.max(jnp.concatenate([a, b])) + 1)
+#         if in_features == 2 * p_guess:
+#             return jnp.concatenate(
+#                 [jax.nn.one_hot(a, p_guess), jax.nn.one_hot(b, p_guess)], axis=1
+#             ).astype(jnp.float32)
+#         if in_features == p_guess:
+#             return (jax.nn.one_hot(a, p_guess) + jax.nn.one_hot(b, p_guess)).astype(jnp.float32)
+#         raise ValueError("Unsupported first-layer input format.")
+    
+# def make_energy_funcs_MLP(model, params: dict, *, num_probes: int = 1):
+#     """
+#     不再构造显式 Jacobian。
+#     用 Hutchinson trick：E_v ||J v||^2 = ||J||_F^2，其中 v~N(0, I_D)。
+#     这样只用到 JVP，不会产生 (C,D) 的大张量。
+#     """
+#     def f_embed(x_embed: jnp.ndarray) -> jnp.ndarray:
+#         logits, _ = model.call_from_embedding(x_embed, params)
+#         return logits  # (C,)
+
+#     # 单样本 energy：平均 num_probes 次随机方向的 ||J v||^2
+#     def _energy_single(x_embed: jnp.ndarray, key: Any) -> jnp.ndarray:
+#         def _one_probe(k):
+#             v = jax.random.normal(k, x_embed.shape)  # (D,)
+#             # jvp 返回 (f(x), J v)，我们只要 J v
+#             jv = jax.jvp(f_embed, (x_embed,), (v,))[1]  # (C,)
+#             return jnp.vdot(jv, jv)  # ||J v||^2
+
+#         keys = jax.random.split(key, num_probes)
+#         vals = jax.vmap(_one_probe)(keys)
+#         return jnp.mean(vals)
+
+#     _energy_single = jax.jit(_energy_single)
+
+#     @jax.jit
+#     def batch_energy_sum(batch_emb: jnp.ndarray, key: Any) -> jnp.ndarray:
+#         # 为 batch 中每个样本分一个子 key
+#         keys = jax.random.split(key, batch_emb.shape[0])
+#         energies = jax.vmap(_energy_single)(batch_emb, keys)  # (B,)
+#         return jnp.sum(energies)  # Σ ||J||_F^2 (Hutchinson 估计)
+
+#     def emb_fn(x_data: jnp.ndarray) -> jnp.ndarray:
+#         return compute_embeddings_MLP(model, params, x_data)
+
+#     return emb_fn, batch_energy_sum
+
+# def select_num_probes_by_group_size(group_size: int) -> int:
+#     """
+#     经验阈值（全网格/较大样本时很稳）：
+#       N >= 289  -> 1
+#       81 <= N < 289 -> 2
+#       25 <= N < 81  -> 4
+#       N < 25        -> 8
+#     理由：Hutchinson 方差 ~ 1/sqrt(N * K)。组越大，需要的 K 越小。
+#     """
+#     if group_size >= 289:
+#         return 1
+#     if group_size >= 81:
+#         return 2
+#     if group_size >= 25:
+#         return 4
+#     return 8
+
+# def compute_dirichlet_energy_embedding_MLP(
+#     model,
+#     params: dict,
+#     x_data: jnp.ndarray,           # (N,2)
+#     *,
+#     chunk_size: int = 2048,        # 更保守的缺省
+#     num_probes: int = 1,
+#     key: Optional[Any] = None,
+# ) -> float:
+#     """
+#     流式计算：不再一次性 materialize 整个 emb。
+#     """
+#     # 复用上面的低内存实现
+#     N = x_data.shape[0]
+#     if N == 0:
+#         return 0.0
+#     num_probes_calc = select_num_probes_by_group_size(N)
+#     num_probes = max(int(num_probes), int(num_probes_calc))
+#     num_probes = int(jnp.clip(num_probes, 1, 8))
+#     emb_fn, batch_energy_sum = make_energy_funcs_MLP(model, params, num_probes=num_probes)
+#     if key is None:
+#         key = jax.random.PRNGKey(0)
+    
+#     total = jnp.array(0.0)
+#     for s in range(0, N, chunk_size):
+#         e_batch = emb_fn(x_data[s:s + chunk_size])       # (b, D)
+#         key, sub = jax.random.split(key)
+#         total = total + batch_energy_sum(e_batch, sub)
+#     return float(total / N)
+
+# # ---------------- Dirichlet energy (MLP) ----------------
 def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
     """
     Build the first-layer input embedding for an MLP model.
@@ -104,37 +254,25 @@ def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
         if in_features == p_guess:
             return (jax.nn.one_hot(a, p_guess) + jax.nn.one_hot(b, p_guess)).astype(jnp.float32)
         raise ValueError("Unsupported first-layer input format.")
-    
-def make_energy_funcs_MLP(model, params: dict, *, num_probes: int = 1):
+
+def make_energy_funcs_MLP(model, params: dict):
     """
-    不再构造显式 Jacobian。
-    用 Hutchinson trick：E_v ||J v||^2 = ||J||_F^2，其中 v~N(0, I_D)。
-    这样只用到 JVP，不会产生 (C,D) 的大张量。
+    Returns:
+      emb_fn(x_int)            -> first-layer embedding for a batch: (B, D or 2D)
+      batch_energy_sum(emb_B)  -> sum over batch of ||J||_F^2
+    where f_embed : embedding -> logits, and J = d logits / d embedding.
+    Requires that `model.call_from_embedding(emb, params)` returns (logits, ...).
     """
     def f_embed(x_embed: jnp.ndarray) -> jnp.ndarray:
         logits, _ = model.call_from_embedding(x_embed, params)
         return logits  # (C,)
 
-    # 单样本 energy：平均 num_probes 次随机方向的 ||J v||^2
-    def _energy_single(x_embed: jnp.ndarray, key: Any) -> jnp.ndarray:
-        def _one_probe(k):
-            v = jax.random.normal(k, x_embed.shape)  # (D,)
-            # jvp 返回 (f(x), J v)，我们只要 J v
-            jv = jax.jvp(f_embed, (x_embed,), (v,))[1]  # (C,)
-            return jnp.vdot(jv, jv)  # ||J v||^2
-
-        keys = jax.random.split(key, num_probes)
-        vals = jax.vmap(_one_probe)(keys)
-        return jnp.mean(vals)
-
-    _energy_single = jax.jit(_energy_single)
+    grad_f = jax.jit(jax.jacrev(f_embed))
 
     @jax.jit
-    def batch_energy_sum(batch_emb: jnp.ndarray, key: Any) -> jnp.ndarray:
-        # 为 batch 中每个样本分一个子 key
-        keys = jax.random.split(key, batch_emb.shape[0])
-        energies = jax.vmap(_energy_single)(batch_emb, keys)  # (B,)
-        return jnp.sum(energies)  # Σ ||J||_F^2 (Hutchinson 估计)
+    def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
+        J = jax.vmap(grad_f)(batch_emb)  # (B, C, D)
+        return jnp.sum(J * J)
 
     def emb_fn(x_data: jnp.ndarray) -> jnp.ndarray:
         return compute_embeddings_MLP(model, params, x_data)
@@ -146,130 +284,156 @@ def compute_dirichlet_energy_embedding_MLP(
     params: dict,
     x_data: jnp.ndarray,           # (N,2)
     *,
-    chunk_size: int = 2048,        # 更保守的缺省
-    num_probes: int = 1,
-    key: Optional[Any] = None,
+    chunk_size: int = 8192,
 ) -> float:
     """
-    流式计算：不再一次性 materialize 整个 emb。
+    Average Dirichlet energy over x_data:
+      (1/N) * Σ_x || d logits(x) / d emb(x) ||_F^2
     """
-    # 复用上面的低内存实现
-    emb_fn, batch_energy_sum = make_energy_funcs_MLP(model, params, num_probes=num_probes)
-    if key is None:
-        key = jax.random.PRNGKey(0)
-
+    emb_fn, batch_energy_sum = make_energy_funcs_MLP(model, params)
+    # emb = emb_fn(x_data)  # (N, D or 2D)
     N = x_data.shape[0]
     total = jnp.array(0.0)
     for s in range(0, N, chunk_size):
-        e_batch = emb_fn(x_data[s:s + chunk_size])       # (b, D)
-        key, sub = jax.random.split(key)
-        total = total + batch_energy_sum(e_batch, sub)
+        e = emb_fn(x_data[s:s+chunk_size]) 
+        total = total + batch_energy_sum(e)
     return float(total / N)
 
-# # # ---------------- Dirichlet energy (MLP) ----------------
-# def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
-#     """
-#     Build the first-layer input embedding for an MLP model.
-#     Tries to infer whether the first layer expects concat/add embeddings or one-hot.
 
-#     x: (B,2) int32 of indices (a,b)
-#     """
-#     a, b = x[:, 0], x[:, 1]
+###### Transformer Dirichlet (upgraded) ########
 
-#     def _find_first_dense_kernel(params_tree):
-#         for k, v in params_tree.items():
-#             if isinstance(v, dict):
-#                 if "kernel" in v:
-#                     return v["kernel"]
-#                 out = _find_first_dense_kernel(v)
-#                 if out is not None:
-#                     return out
-#         return None
+# 1) Pure-JAX embedding extractor — compatible with TransformerOneEmbed & TwoEmbed
+def compute_embeddings_transformer(
+    model,
+    params: dict,
+    x: jnp.ndarray,                      # (B, 2)  int32 tokens (a,b)
+    *,
+    concat: bool = False,                # False → “E_a + E_b”; True → “[E_a‖E_b]”
+) -> jnp.ndarray:
+    """
+    Build the *first-block input embedding* (post position-embed) for the transformer.
 
-#     if hasattr(model, "extract_embeddings_ab"):
-#         Wa, Wb = model.extract_embeddings_ab(params)  # (p, D_a), (p, D_b)
-#         Da, Db = Wa.shape[1], Wb.shape[1]
-#         k0 = _find_first_dense_kernel(params)
-#         if k0 is None:
-#             # Fallback: add embeddings if we cannot infer input size
-#             return Wa[a] + Wb[b]
-#         in_features = k0.shape[0]
-#         p_vocab = Wa.shape[0]
+    Returns the vector that feeds the first Transformer block *after* adding
+    learned position embeddings:
 
-#         # Concat learned embeddings
-#         if in_features == Da + Db:
-#             return jnp.concatenate([Wa[a], Wb[b]], axis=1)
-#         # Add learned embeddings
-#         if in_features == Da:
-#             return Wa[a] + Wb[b]
-#         # One-hot concat
-#         if in_features == 2 * p_vocab:
-#             return jnp.concatenate(
-#                 [jax.nn.one_hot(a, p_vocab), jax.nn.one_hot(b, p_vocab)], axis=1
-#             ).astype(jnp.float32)
-#         # One-hot addition
-#         if in_features == p_vocab:
-#             return (jax.nn.one_hot(a, p_vocab) + jax.nn.one_hot(b, p_vocab)).astype(jnp.float32)
+      • concat == False  → shape (B, D)     representing (E_a + E_b) + (pos0 + pos1)
+      • concat == True   → shape (B, 2D)    representing [E_a+pos0  ‖  E_b+pos1]
 
-#         # Last resort
-#         return Wa[a] + Wb[b]
-#     else:
-#         # No extract_embeddings_ab → assume one-hot style first layer
-#         k0 = _find_first_dense_kernel(params)
-#         if k0 is None:
-#             raise ValueError("Cannot infer first-layer input size for embeddings.")
-#         in_features = k0.shape[0]
-#         p_guess = int(jnp.max(jnp.concatenate([a, b])) + 1)
-#         if in_features == 2 * p_guess:
-#             return jnp.concatenate(
-#                 [jax.nn.one_hot(a, p_guess), jax.nn.one_hot(b, p_guess)], axis=1
-#             ).astype(jnp.float32)
-#         if in_features == p_guess:
-#             return (jax.nn.one_hot(a, p_guess) + jax.nn.one_hot(b, p_guess)).astype(jnp.float32)
-#         raise ValueError("Unsupported first-layer input format.")
+    Compatible with:
+      - TransformerOneEmbed.extract_embeddings_ab -> (W_E, W_E)
+      - TransformerTwoEmbed.extract_embeddings_ab -> (W_a, W_b)
+    """
+    a, b = x[:, 0], x[:, 1]
+    Wa, Wb = model.extract_embeddings_ab(params)           # (p, D), (p, D)
 
-# def make_energy_funcs_MLP(model, params: dict):
-#     """
-#     Returns:
-#       emb_fn(x_int)            -> first-layer embedding for a batch: (B, D or 2D)
-#       batch_energy_sum(emb_B)  -> sum over batch of ||J||_F^2
-#     where f_embed : embedding -> logits, and J = d logits / d embedding.
-#     Requires that `model.call_from_embedding(emb, params)` returns (logits, ...).
-#     """
-#     def f_embed(x_embed: jnp.ndarray) -> jnp.ndarray:
-#         logits, _ = model.call_from_embedding(x_embed, params)
-#         return logits  # (C,)
+    # learned pos of the first two positions
+    pos0, pos1 = params["pos_embed"]["W_pos"][:2]         # (D,), (D,)
 
-#     grad_f = jax.jit(jax.jacrev(f_embed))
+    emb_a = Wa[a] + pos0                                  # (B, D)
+    emb_b = Wb[b] + pos1                                  # (B, D)
 
-#     @jax.jit
-#     def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
-#         J = jax.vmap(grad_f)(batch_emb)  # (B, C, D)
-#         return jnp.sum(J * J)
+    if concat:
+        return jnp.concatenate([emb_a, emb_b], axis=-1)   # (B, 2D)
+    else:
+        return emb_a + emb_b                              # (B, D)
 
-#     def emb_fn(x_data: jnp.ndarray) -> jnp.ndarray:
-#         return compute_embeddings_MLP(model, params, x_data)
 
-#     return emb_fn, batch_energy_sum
+# 2) Energy functions — match MLP interface/returns
+def make_energy_funcs_transformer(
+    model,                 # initialized TransformerOneEmbed or TransformerTwoEmbed
+    params: dict,          # its parameters
+    *,
+    concat: bool = False,
+):
+    """
+    Returns:
+      emb_fn(x_int)            -> (B, D|2D)  batch input embeddings (already has pos)
+      batch_energy_sum(emb_B)  -> scalar: Σ_b ||J||_F^2
 
-# def compute_dirichlet_energy_embedding_MLP(
-#     model,
-#     params: dict,
-#     x_data: jnp.ndarray,           # (N,2)
-#     *,
-#     chunk_size: int = 8192,
-# ) -> float:
-#     """
-#     Average Dirichlet energy over x_data:
-#       (1/N) * Σ_x || d logits(x) / d emb(x) ||_F^2
-#     """
-#     emb_fn, batch_energy_sum = make_energy_funcs_MLP(model, params)
-#     emb = emb_fn(x_data)  # (N, D or 2D)
-#     N = emb.shape[0]
-#     total = 0.0
-#     for s in range(0, N, chunk_size):
-#         total += float(batch_energy_sum(emb[s:s+chunk_size]))
-#     return total / N
+    where f_embed : flat-embedding -> (last-token) logits, and
+    J = ∂ logits / ∂ flat-embedding.
+    """
+    Wa, _ = model.extract_embeddings_ab(params)
+    D = Wa.shape[1]  # d_model
+
+    # Convert flat (D|2D,) into a (1, 2, D) sequence embedding for call_from_embedding_sequence
+    def _to_seq(x_flat: jnp.ndarray) -> jnp.ndarray:
+        if concat:
+            ea, eb = jnp.split(x_flat, 2)                 # (D,), (D,)
+        else:
+            # Unbiased "split" of (E_a + E_b): treat both as 1/2 so gradients distribute
+            ea = x_flat * 0.5
+            eb = x_flat * 0.5
+        return jnp.stack([ea, eb])[None, ...]             # (1, 2, D)
+
+    # Single sample: flat embedding → last-token logits (p,)
+    def f_embed(x_flat: jnp.ndarray) -> jnp.ndarray:
+        seq_emb = _to_seq(x_flat)                                      # (1,2,D)
+        logits  = model.call_from_embedding_sequence(seq_emb, params)  # (1,2,p)
+        return logits[0, -1]                                           # (p,)
+
+    # Jitted Jacobian of logits wrt flat embedding, computed once then vmapped
+    grad_f = jax.jit(jax.jacrev(f_embed))  # (p,) wrt (D|2D,) → (p, D|2D)
+
+    @jax.jit
+    def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
+        """
+        batch_emb: (B, D|2D)
+        returns:   scalar Σ_b ||J_b||_F^2
+        """
+        J = jax.vmap(grad_f)(batch_emb)  # (B, p, D|2D)
+        return jnp.sum(J * J)
+
+    # External: tokens (a,b) → flat embedding (already has pos added)
+    emb_fn = partial(compute_embeddings_transformer, model, params, concat=concat)
+
+    return emb_fn, batch_energy_sum
+
+
+# 3) Driver: chunked average over an input set
+def compute_dirichlet_energy_embedding_transformer(
+    model,
+    params: dict,
+    x_data: jnp.ndarray,                 # (N, 2) token pairs (a,b)
+    *,
+    chunk_size: int = 8192,              # match MLP_dirichlet default
+    concat: bool = False,
+) -> float:
+    """
+    Average Dirichlet energy over x_data:
+      (1/N) * Σ_x || ∂ logits(x) / ∂ emb(x) ||_F^2
+    """
+    emb_fn, batch_energy_sum = make_energy_funcs_transformer(model, params, concat=concat)
+
+    N = int(x_data.shape[0])
+    total = jnp.array(0.0)
+    for s in range(0, N, chunk_size):
+        e = emb_fn(x_data[s:s+chunk_size])     # (B, D|2D), already includes pos
+        total = total + batch_energy_sum(e)    # scalar on device
+    return float(total / N)
+
+### dispatcher that auto-detects MLP or Transformer
+def _is_transformer(model) -> bool:
+    return hasattr(model, "call_from_embedding_sequence") and callable(getattr(model, "call_from_embedding_sequence"))
+
+def compute_dirichlet_energy_embedding_auto(
+    model,
+    params: dict,
+    x_data: jnp.ndarray,           # (N,2)
+    *,
+    chunk_size: int = 8192,
+    # if you ever need to change Transformer flattening behavior:
+    transformer_concat: bool = False,
+) -> float:
+    if _is_transformer(model):
+        # Transformer Dirichlet
+        return compute_dirichlet_energy_embedding_transformer(
+            model, params, x_data, chunk_size=chunk_size, concat=transformer_concat
+        )
+    # MLP Dirichlet
+    return compute_dirichlet_energy_embedding_MLP(
+        model, params, x_data, chunk_size=chunk_size
+    )
 
 # def run_epochs(*,
 #                model,
@@ -463,7 +627,7 @@ def run_epochs_scaling(*,
         return None
 
     seeds_arr = jnp.asarray(random_seed_ints, dtype=jnp.uint32)
-    energy_chunk = int(min(2048, x_batches.shape[2] * 2))
+    energy_chunk = int(min(128, x_batches.shape[2] * 2))
 
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
@@ -522,12 +686,13 @@ def run_epochs_scaling(*,
 
                 # Dirichlet energies
                 if xs_eval_for_energy is not None:
-                    de_test = compute_dirichlet_energy_embedding_MLP(
+                    de_test = compute_dirichlet_energy_embedding_auto(
                         model, params_i, xs_eval_for_energy, chunk_size=energy_chunk
                     )
                 else:
                     de_test = float("nan")
-                de_train = compute_dirichlet_energy_embedding_MLP(
+
+                de_train = compute_dirichlet_energy_embedding_auto(
                     model, params_i, xb_i, chunk_size=energy_chunk
                 )
                 
@@ -568,139 +733,3 @@ def run_epochs_scaling(*,
 
     return states, logs_by_seed, first_100, first_loss, first_ce
 
-
-
-###### MLP #########
-
-
-###### Trans ########
-
-from functools import partial
-# 1)  pure-JAX embedding extractor
-def compute_embeddings_transformer(
-    model,
-    params: dict,
-    x: jnp.ndarray,                       # (B , 2)  int32 tokens  (a , b)
-    *,
-    concat: bool = False,                 # False →  “Eₐ + E_b”    True →  “[Eₐ‖E_b]”
-) -> jnp.ndarray:
-    """
-    Returns the *input* embedding vector that will be fed into the first
-    Transformer block, **after** adding learnt position embeddings.
-
-    • `concat == False`   →  shape  (B , D)
-    • `concat == True`    →  shape  (B , 2 D)
-    """
-    # ---- 1. grab weights ----------------------------------------------------
-    # shared token table (W_E)  &  first two learned position vectors
-    Wa, Wb = model.extract_embeddings_ab(params)            # (p , D)
-    pos0, pos1 = params["pos_embed"]["W_pos"][:2]                   # (D,)
-    a_idx = x[:, 0]
-    b_idx = x[:, 1]
-
-    # ---- 2. look-up & add positions ----------------------------------------
-    emb_a = Wa[a_idx] + pos0                              # (B, D)
-    emb_b = Wb[b_idx] + pos1                                   # (B , D)
-
-    if concat:
-        return jnp.concatenate([emb_a, emb_b], axis=-1)   # (B, 2D)
-    else:
-        return emb_a + emb_b                                     # (B , D)
-
-# # 2)  make_energy_funcs_transformer
-# def make_energy_funcs_transformer(
-#     model,           # the *initialised* model instance
-#     params: dict,                   # its parameters
-#     *,
-#     concat: bool = False,
-# ):
-#     """
-#     Returns two callables **emb_fn** and **batch_energy_sum** that exactly
-#     mirror the MLP helpers:
-
-#     • emb_fn(x_int)              →  embedding batch  (see above)
-#     • batch_energy_sum(e_batch)  →  Σ ‖J‖²_F  over that *batch*
-
-#     where J is the Jacobian  ∂ logits / ∂ embedding.
-#     """
-
-#     # ---------- f_embed : (D,) or (2D,)  →  (p,) logits ----------------------
-#     Wa, _ = model.extract_embeddings_ab(params)
-#     D = Wa.shape[1]
-
-#     def _to_seq(x_flat: jnp.ndarray) -> jnp.ndarray:
-#         if concat:
-#             ea, eb = jnp.split(x_flat, 2)
-#         else:
-#             ea = x_flat * 0.5
-#             eb = x_flat * 0.5
-#         return jnp.stack([ea, eb])[None, ...]             # (1, 2, D)
-
-#     def f_embed(x_flat: jnp.ndarray) -> jnp.ndarray:      # → (p,)
-#         seq_emb = _to_seq(x_flat)                         # (1, 2, D)
-#         logits  = model.call_from_embedding_sequence(seq_emb, params)[0]
-#         return logits[-1]                                  # last-token logits
-
-#     f_embed = jax.jit(f_embed)
-
-#     def _squared_frobenius_norm_of_jac(x_flat: jnp.ndarray) -> jnp.ndarray:
-#         J = jax.jacrev(f_embed)(x_flat)                   # (p, D | 2D)
-#         return jnp.sum(J * J)
-
-#     _squared_frobenius_norm_of_jac = jax.jit(_squared_frobenius_norm_of_jac)
-
-#     emb_fn = partial(compute_embeddings_transformer, model, params, concat=concat)
-
-#     def batch_energy_sum(batch_emb: jnp.ndarray) -> jnp.ndarray:
-#         return jax.vmap(_squared_frobenius_norm_of_jac)(batch_emb).sum()
-
-#     return emb_fn, batch_energy_sum
-
-# # 3)  driver that averages over an arbitrary input set
-# def compute_dirichlet_energy_embedding_transformer(
-#     model,
-#     params: dict,
-#     x_data: jnp.ndarray,                 # (N , 2)  all (a , b) pairs of interest
-#     *,
-#     batch_size: int = 1024,
-#     concat: bool = False,
-# ) -> float:
-#     """
-#     Plain (non-JIT) wrapper that chunks `x_data` to keep memory modest.
-#     """
-#     emb_fn, batch_energy_sum = make_energy_funcs_transformer(
-#         model, params, concat=concat
-#     )
-
-#     total = 0.0
-#     n     = x_data.shape[0]
-
-#     for i in range(0, n, batch_size):
-#         x_batch   = x_data[i : i + batch_size]
-#         e_batch   = emb_fn(x_batch)                       # (B , D | 2D)
-#         total    += batch_energy_sum(e_batch)
-
-#     return float(total / n)
-
-# def make_energy_funcs_transformer(..., num_probes=1, concat=False):
-#     def f_embed(x_flat):
-#         seq = _to_seq(x_flat)              # (1, 2, D)
-#         logits = model.call_from_embedding_sequence(seq, params)[0]
-#         return logits[-1]                   # (C,)
-
-#     @jax.jit
-#     def _energy_single(x_flat, key):
-#         def _one_probe(k):
-#             v = jax.random.normal(k, x_flat.shape)
-#             jv = jax.jvp(f_embed, (x_flat,), (v,))[1]
-#             return jnp.vdot(jv, jv)
-#         keys = jax.random.split(key, num_probes)
-#         return jnp.mean(jax.vmap(_one_probe)(keys))
-
-#     @jax.jit
-#     def batch_energy_sum(batch_emb, key):
-#         keys = jax.random.split(key, batch_emb.shape[0])
-#         return jax.vmap(_energy_single)(batch_emb, keys).sum()
-
-#     emb_fn = partial(compute_embeddings_transformer, model, params, concat=concat)
-#     return emb_fn, batch_energy_sum

@@ -57,7 +57,8 @@ def step_size(f: int, p: int) -> int:
     # invert f/g modulo n
     return pow(f // g, -1, n)
 
-def _remap_block(block: np.ndarray) -> tuple[np.ndarray,int,int]:
+import numpy as onp
+def _remap_block(block: onp.ndarray):
     """
     Definition 4.2 style remap:
       let h(a,b)=block[a,b], freq=(fa,fb).
@@ -73,21 +74,11 @@ def _remap_block(block: np.ndarray) -> tuple[np.ndarray,int,int]:
     fb, fa = dominant_freqs_ab(block)
 
     # 2. calculate step sizes (didn't use them here though)
-    db = step_size(fb, p)
-    da = step_size(fa, p)
-
-    # 3. remap
-    out = np.zeros_like(block)
-    for a2 in range(p):
-        for b2 in range(p):
-            # a0 = (da * a2) % p
-            # b0 = (db * b2) % p
-            #out[a2, b2] = block[a0, b0]
-            a0 = (fa * a2) % p
-            b0 = (fb * b2) % p
-            out[a0, b0] = block[a2, b2]
-
-    return out, fb, fa
+    A = (fa * jnp.arange(p)) % p
+    B = (fb * jnp.arange(p)) % p
+    out = jnp.zeros_like(block)
+    out = out.at[A[:, None], B[None, :]].set(block)
+    return onp.asarray(out), fb, fa
 # out[(fa * a) % p, (fb * b) % p] = block[a, b]
 def dominant_freqs_ab(grid: np.ndarray) -> Tuple[int, int]:
     """Find the dominant single-frequency component along the horizontal (b)
@@ -1122,23 +1113,27 @@ def single_neuron_figure(n,                      # ← neuron index
 
 def _two_stage_kmeans_prune(
     log_mp: np.ndarray,
-    thresh1: float = 2.0,   
-    thresh2: float = 2.0,  
+    thresh1: float = 2.0,
+    thresh2: float = 2.0,
     seed: int = 0
 ) -> tuple[np.ndarray, np.ndarray]:
-    
+
     assert log_mp.ndim == 1
     x = log_mp.reshape(-1, 1)
-
     n = x.shape[0]
 
     # ---------- Degenerate sizes ----------
     if n == 0:
-        # empty set
         return np.array([], dtype=int), np.array([], dtype=int)
     if n == 1:
-        # only one element
         return np.array([0], dtype=int), np.array([], dtype=int)
+
+    # ---------- Guard: not enough distinct values for 2 clusters ----------
+    n_unique = np.unique(x, axis=0).shape[0]
+    if n_unique < 2:
+        keep = np.arange(n, dtype=int)
+        drop = np.array([], dtype=int)
+        return keep, drop
 
     # ---------- Stage 1 ----------
     km1 = KMeans(n_clusters=2, n_init='auto', random_state=seed)
@@ -1156,22 +1151,21 @@ def _two_stage_kmeans_prune(
     keep2 = keep1
     if keep1.size >= 2:
         x2 = x[keep1]
-        km2 = KMeans(n_clusters=2, n_init='auto', random_state=seed+1)
-        lab2 = km2.fit_predict(x2)
-        centers2 = km2.cluster_centers_.ravel()
-        hi2 = int(np.argmax(centers2))
-        gap2 = float(abs(centers2[0] - centers2[1]))
-
-        if gap2 >= float(thresh2):
-            rel_keep2 = np.flatnonzero(lab2 == hi2)
-            keep2 = keep1[rel_keep2]
-        
+        if np.unique(x2, axis=0).shape[0] >= 2:
+            km2 = KMeans(n_clusters=2, n_init='auto', random_state=seed + 1)
+            lab2 = km2.fit_predict(x2)
+            centers2 = km2.cluster_centers_.ravel()
+            hi2 = int(np.argmax(centers2))
+            gap2 = float(abs(centers2[0] - centers2[1]))
+            if gap2 >= float(thresh2):
+                rel_keep2 = np.flatnonzero(lab2 == hi2)
+                keep2 = keep1[rel_keep2]
 
     # ---------- Safety ----------
     if keep2.size == 0:
         keep2 = np.array([int(np.argmax(x))], dtype=int)
 
-    # ---------- drop  ----------
+    # ---------- drop ----------
     all_idx = np.arange(x.size, dtype=int)
     drop = np.setdiff1d(all_idx, keep2, assume_unique=False)
     return keep2, drop
@@ -1192,22 +1186,22 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
     # 1) DFT once
     flat_all = pre_grid.reshape(G*G, N)
     F_full   = dft_2d(flat_all)
-    F_L      = dft_2d(left)
-    F_R      = dft_2d(right)
+    # F_L      = dft_2d(left)
+    # F_R      = dft_2d(right)
 
     # 2) cluster
-    names = [lab for lab, _, _,_ in irreps]
+    names = [lab for lab, _, _, _ in irreps]
     irrep2neurons = defaultdict(list)
-    freq_cluster  = defaultdict(list) 
-    diag_labels   = set()       
-    neuron2pair   = {}
+    # freq_cluster  = defaultdict(list)   # 记录所有 neuron（r==s）
+    diag_labels   = set()               # 将在 prune 之后重建
+    # neuron2pair   = {}
 
-    freq_clust_2d = {
-        "diag":      defaultdict(list),
-        "row":       defaultdict(list),    
-        "col":       defaultdict(list),    
-        "pair_axis": defaultdict(list),    
-    }
+    # freq_clust_2d = {
+    #     "diag":      defaultdict(list),
+    #     "row":       defaultdict(list),
+    #     "col":       defaultdict(list),
+    #     "pair_axis": defaultdict(list),
+    # }
 
     neuron_data = {}
     for n in range(N):
@@ -1215,28 +1209,29 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
         dom = _classify_by_gft(Fhat_n, names, freq_map, strict=strict)
         r_star, s_star = dom["r_star"], dom["s_star"]
         irrep2neurons[(r_star, s_star)].append(n)
-        neuron2pair[n] = (r_star, s_star)
-        if r_star == s_star:
-            if r_star not in freq_map:
-                if strict:
-                    raise KeyError(f"freq_map no mapping for irrep '{r_star}'")
-                else:
-                    # skip unknown label
-                    continue
-            f = int(freq_map[r_star])
-            freq_cluster[f].append(int(n))  
-            
-            diag_labels.add((r_star, dom["kind"]))
-        
-        if dom["kind"] == "diag" and dom["fa"] is not None:
-            freq_clust_2d["diag"][dom["fa"]].append(int(n))
-        else:
-            if dom["fa"] is not None:
-                freq_clust_2d["row"][dom["fa"]].append(int(n))
-            if dom["fb"] is not None:
-                freq_clust_2d["col"][dom["fb"]].append(int(n))
-            if dom["fa"] is not None and dom["fb"] is not None:
-                freq_clust_2d["pair_axis"][(int(dom["fa"]), int(dom["fb"]))].append(int(n))
+        # neuron2pair[n] = (r_star, s_star)
+
+        # # freq_cluster：全量记录（r==s）
+        # if r_star == s_star:
+        #     if r_star not in freq_map:
+        #         if strict:
+        #             raise KeyError(f"freq_map no mapping for irrep '{r_star}'")
+        #         else:
+        #             # skip unknown label
+        #             continue
+        #     f = int(freq_map[r_star])
+        #     freq_cluster[f].append(int(n))
+
+        # # freq_clust_2d：保持原逻辑
+        # if dom["kind"] == "diag" and dom["fa"] is not None:
+        #     freq_clust_2d["diag"][dom["fa"]].append(int(n))
+        # else:
+        #     if dom["fa"] is not None:
+        #         freq_clust_2d["row"][dom["fa"]].append(int(n))
+        #     if dom["fb"] is not None:
+        #         freq_clust_2d["col"][dom["fb"]].append(int(n))
+        #     if dom["fa"] is not None and dom["fb"] is not None:
+        #         freq_clust_2d["pair_axis"][(int(dom["fa"]), int(dom["fb"]))].append(int(n))
 
         # 2d) neuron_data
         entry = {
@@ -1279,24 +1274,42 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
             drop = [int(neuron_list[i]) for i in drop_rel]
             per_log = {int(neuron_list[i]): float(log_mp[i]) for i in range(log_mp.size)}
             cluster_prune[(r, s)] = {"main": main, "drop": drop, "per_neuron_log10": per_log}
-        
+
+    # === diag_labels contains only main neurons===
+    diag_labels = set()
+    if prune_cfg is not None:
+        # 只统计 main（不计 drop）
+        for (r, s), pr in cluster_prune.items():
+            if r != s:
+                continue
+            for n in pr.get("main", []):
+                kind_n = neuron_data[int(n)]["dominant"]["kind"]
+                diag_labels.add((r, kind_n))
+    else:
+        # 未启用 prune：按全部神经元统计
+        for (r, s), neuron_list in irrep2neurons.items():
+            if r != s:
+                continue
+            for n in neuron_list:
+                kind_n = neuron_data[int(n)]["dominant"]["kind"]
+                diag_labels.add((r, kind_n))
 
     artifacts = {
-        "F_full": F_full, "F_L": F_L, "F_R": F_R,
+        "F_full": F_full, # "F_L": F_L, "F_R": F_R,
         "names": names,
         "irrep2neurons": irrep2neurons,
-        "freq_cluster": freq_cluster,           
-        "freq_clust_2d": freq_clust_2d, 
-        "diag_labels": diag_labels,
-        "neuron2pair": neuron2pair,
-        "neuron_data": neuron_data, 
+        # "freq_cluster": freq_cluster,        # includes both main and drop
+        # "freq_clust_2d": freq_clust_2d,
+        "diag_labels": diag_labels,          # only main
+        # "neuron2pair": neuron2pair,
+        "neuron_data": neuron_data,
     }
     if prune_cfg is not None:
         artifacts["cluster_prune"] = cluster_prune
     return artifacts
 
 
-def summarize_diag_labels(diag_labels: Iterable[str], p: int, names: List[str]) -> Dict[str, Any]:
+def summarize_diag_labels(diag_labels: Iterable[Tuple[str, str]], p: int, names: List[str]) -> Dict[str, Any]:
     """
     group irreps based on the followings:
       - approx_coset:   2D_x and gcd(p, x) == 1
@@ -1385,57 +1398,6 @@ def summarize_diag_labels(diag_labels: Iterable[str], p: int, names: List[str]) 
 
     return summary
     
-    # for lab in diag_labels:
-    #     s = lab.strip()
-    #     m = pat_2d.match(s)
-    #     if m:
-    #         f = int(m.group(1))
-    #         if math.gcd(p, f) == 1:
-    #             approx_coset.append({"label": s, "f": f, "gcd_pf": 1})
-    #         else:
-    #             coset_2d.append({"label": s, "f": f, "gcd_pf": math.gcd(p, f)})
-    #     elif s.lower() in names_1d:
-    #         coset_1d.append({"label": s})
-    #     else:
-    #         others.append({"label": s})
-
-    # counts = {
-    #     "approx_coset": len(approx_coset),
-    #     "coset_2d":     len(coset_2d),
-    #     "coset_1d":     len(coset_1d),
-    #     "others":       len(others),
-    #     "total_diag":   total_diag,
-    # }
-
-    # # consistency check：sum of 3 types + others == #diag_labels
-    # sum_all = counts["approx_coset"] + counts["coset_2d"] + counts["coset_1d"] + counts["others"]
-    # consistency_ok = (sum_all == total_diag)
-
-    # # approx coset proportion
-    # approx_ratio = (counts["approx_coset"] / total_diag) if total_diag > 0 else 0.0
-
-    # summary = {
-    #     "p": p,
-    #     "names": names,
-    #     "items": {
-    #         "approx_coset": approx_coset,
-    #         "coset_2d":     coset_2d,
-    #         "coset_1d":     coset_1d,
-    #         "others":       others,
-    #     },
-    #     "counts": counts,
-    #     "consistency": {
-    #         "ok": consistency_ok,
-    #         "sum_all": sum_all,
-    #         "expected_total": total_diag,
-    #         "missing_when_not_ok": (
-    #             [] if consistency_ok else
-    #             list(sorted(diag_labels - set(x["label"] for grp in [approx_coset, coset_2d, coset_1d, others] for x in grp)))
-    #         )
-    #     },
-    #     "approx_ratio_in_diag": approx_ratio,
-    # }
-    # return summary
 
 # ---------------------------------------------------------------------------
 # main entry

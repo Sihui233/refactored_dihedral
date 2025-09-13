@@ -11,10 +11,20 @@ import random
 # -----------------------------
 LR_LIST = [1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4, 1e-3, 2e-3]
 WD_LIST = [1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
-P_LIST = [2 ** 5, 2 ** 9]  
+# P_LIST = [2 ** 5, 2 ** 9]  
 # P_LIST = [2 ** e for e in range(2, 13)]    # 2^2 ... 2^12
-NUM_LAYERS_LIST = [1, 2]
-SEEDS = list(range(5))     
+
+# P_LIST = [2 ** e for e in range(2, 9)]
+# NUM_LAYERS_LIST = [1]
+# SEEDS = list(range(1))
+
+# P_LIST = [2 ** e for e in range(2, 9)]
+# NUM_LAYERS_LIST = [2]
+# SEEDS = list(range(1))  
+
+P_LIST = [2 ** e for e in range(9, 12)] # change time to 72:00:00 and neurons to 10000
+NUM_LAYERS_LIST = [1,2]
+SEEDS = list(range(1))
 
 # # test
 # LR_LIST = [1e-5]
@@ -27,10 +37,10 @@ SEEDS = list(range(5))
 # global variables
 # -----------------------------
 OPTIMIZER = "adam"
-EPOCHS = 500
+EPOCHS = 700
 BATCH_EXPERIMENT = "random_random"
 MLP_CLASS = "two_embed"     
-FEATURES = 128              
+FEATURES = 128            
 
 # -----------------------------
 # Slurm/队列节流设置
@@ -42,7 +52,7 @@ MAX_SUBMIT_ATTEMPTS = 6
 INITIAL_BACKOFF = 30       
 MAX_BACKOFF = 600          
 
-SHUFFLE_COMBOS = True
+SHUFFLE_COMBOS = False
 
 
 def compute_num_neurons(p: int) -> int:
@@ -67,13 +77,14 @@ def compute_k(p: int) -> int:
         floor(0.8*p*2)   if 2^4 <= p < 2^8
         floor(0.6*p*2)   if p >= 2^8 
     """
-    # if p < (1 << 4):
-    #     frac = 0.9
+    if p < (1 << 4):
+        frac = 1.0
     # elif p < (1 << 8):
     #     frac = 0.8
     # else:
     #     frac = 0.6
-    frac = 0.9
+    else:
+        frac = 0.9
     return int(frac * p * 2)
 
 def batch_size_for_p(p: int) -> int:
@@ -130,7 +141,8 @@ def main():
         # 依次计算该组合的派生参数
         bs = batch_size_for_p(p)
         k = compute_k(p)
-        num_neurons = compute_num_neurons(p)
+        # num_neurons = compute_num_neurons(p)
+        num_neurons = 10000
         seeds = [str(s) for s in SEEDS]
 
         # —— 准备 argv（严格按 Config.from_argv 的顺序）——

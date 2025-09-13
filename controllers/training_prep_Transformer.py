@@ -1,237 +1,153 @@
-# controllers/training_prep_Transformer.py
-from typing import Dict, Any, Tuple, List
+# controllers/run_training_Transformer.py
+import os
+import sys
+import json
+import gc
+from typing import Dict, List
+
 import jax
 import jax.numpy as jnp
-import numpy as np
-import optax
-from clu import metrics
-from flax import struct
-import jax.tree_util
 
-import dihedral
-import DFT
-from utils import compute_pytree_size
-import training
+from controllers.config_Transformer import Config
+from controllers.paths_Transformer import base_dir, model_dir, seed_graph_dir
+import controllers.training_prep_Transformer as prep
+import analysis.while_training_analysis_gen as wta
 
-from transformer_class import TransformerOneEmbed, TransformerTwoEmbed
 
-Params = Dict[str, Any]
-
-# ---------------- Metrics ----------------
-@struct.dataclass
-class Metrics(metrics.Collection):
-    accuracy: metrics.Accuracy
-    loss: metrics.Average.from_output('loss')
-    l2_loss: metrics.Average.from_output('l2_loss')
-
-# ---------------- small helpers ----------------
-def logits_last_token(logits_3d: jnp.ndarray) -> jnp.ndarray:
-    return logits_3d[:, -1, :]  # (B, vocab)
-
-def cross_entropy_loss(y_pred_3d, y):
-    return optax.softmax_cross_entropy_with_integer_labels(
-        logits=logits_last_token(y_pred_3d), labels=y
-    ).mean()
-
-def total_loss(y_pred_and_l2, y, weight_decay: float):
-    y_pred, _, l2_loss = y_pred_and_l2
-    return cross_entropy_loss(y_pred, y) + l2_loss * weight_decay
-
-def apply_fn_builder(model):
-    def apply(variables, x, training=False):
-        params = variables["params"]
-        outputs = model.apply({"params": params}, x, training=training)  # (B, seq, vocab)
-        l2_loss = sum(jnp.sum(jnp.square(p)) for p in jax.tree_util.tree_leaves(params))
-        return outputs, {}, l2_loss
-    return apply
-
-def compute_metrics(metrics_obj, *, loss, l2_loss, outputs, labels):
-    logits_2d = logits_last_token(outputs)
-    metric_updates = metrics_obj.single_from_model_output(
-        logits=logits_2d, labels=labels, loss=loss, l2_loss=l2_loss
-    )
-    return metrics_obj.merge(metric_updates)
-
-# ---------------- Model / Optimizer ----------------
-def build_model(cfg, group_size: int):
-    assert cfg.d_head * cfg.num_heads == cfg.d_model, "d_head * num_heads must equal d_model"
-    # default TwoEmbed
-    return TransformerTwoEmbed(
-        num_layers=1,                      # block is 1
-        num_mlp_layers=cfg.num_mlp_layers,
-        d_vocab=group_size,
-        d_model=cfg.d_model,
-        d_head=cfg.d_head,
-        num_heads=cfg.num_heads,
-        n_ctx=cfg.n_ctx,
-        act_type=cfg.act_type,
-        attn_coeff=cfg.attn_coeff,
-        nn_multiplier=cfg.nn_multiplier,
+def main(argv):
+    print("start args parsing")
+    cfg = Config.from_argv(argv)
+    print(
+        f"args: lr={cfg.learning_rate}, wd={cfg.weight_decay}, "
+        f"d_model={cfg.d_model}, heads={cfg.num_heads}x{cfg.d_head} "
+        f"(ctx={cfg.n_ctx}), mlp_layers={cfg.num_mlp_layers}, "
+        f"nn_mult={cfg.nn_multiplier}, seeds={cfg.random_seeds}"
     )
 
-def build_optimizer(optimizer_name: str, lr: float, momentum: float = 0.0):
-    if optimizer_name == "adam":
-        return optax.adam(lr)
-    if optimizer_name.startswith("SGD"):
-        return optax.sgd(lr, momentum=momentum)
-    raise ValueError(f"Unsupported optimizer type: {optimizer_name}")
+    training_set_size = cfg.k * cfg.batch_size
+    group_size = 2 * cfg.p
 
-# ---------------- Dataset / eval grid ----------------
-def make_train_batches(p: int, batch_size: int, k: int, random_seed_ints: List[int]):
-    train_ds_list = []
-    for seed in random_seed_ints:
-        x, y = dihedral.make_dihedral_dataset(p, batch_size, k, seed)
-        train_ds_list.append((x, y))
-    x_batches = jnp.stack([x for (x, _) in train_ds_list])
-    y_batches = jnp.stack([y for (_, y) in train_ds_list])
-    print("x_batches.shape =", x_batches.shape, "y_batches.shape =", y_batches.shape)
-    print(f"Number of training batches: {x_batches.shape[1]}")
-    dataset_size_mb = (x_batches.size * x_batches.dtype.itemsize) / (1024 ** 2)
-    print(f"Dataset size per model: {dataset_size_mb:.2f} MB")
-    return train_ds_list, x_batches, y_batches
+    # ---- Paths (match MLP runner’s idea of a stable base + model dir) ----
+    # Keep transformer-specific tag, but directory “architecture” mirrors MLP:
+    # base_dir(...), then a parameterized model_dir(...), then logs under mdir/logs_*
+    model_tag = f"transformer_{cfg.num_mlp_layers}"
+    base = base_dir(cfg.p, model_tag, cfg.d_model, cfg.k)
+    mdir = model_dir(
+        cfg.p,
+        cfg.batch_size,
+        cfg.weight_decay,
+        cfg.epochs,
+        training_set_size,
+        base,
+        cfg.d_model,
+        cfg.nn_multiplier,
+        cfg.num_mlp_layers,
+        cfg.attn_coeff,
+    )
 
-def shuffle_batches_for_epoch(
-    x_batches: jnp.ndarray,  # (M, K, B, 2)
-    y_batches: jnp.ndarray,  # (M, K, B)
-    epoch: int,
-    seeds: List[int],
-    shuffle_within_batch: bool = True,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    M, K, B = x_batches.shape[0], x_batches.shape[1], x_batches.shape[2]
+    # ---- Utility: process seeds in small chunks (like MLP runner) ----
+    def chunks(lst: List[int], n: int):
+        for i in range(0, len(lst), n):
+            yield lst[i : i + n]
 
-    # 1) shuffle batch order (axis=1)
-    perms_k = jnp.stack(
-        [jax.random.permutation(jax.random.fold_in(jax.random.PRNGKey(s), epoch), K)
-         for s in seeds],
-        axis=0
-    )  # (M, K)
+    # You can tweak this based on memory; MLP runner used 1–2
+    seed_chunk_size = 2
 
-    # use take_along_axis to reorder on axis=1
-    gather_idx_k_x = jnp.broadcast_to(perms_k[:, :, None, None], (M, K, B, 1))
-    gather_idx_k_y = jnp.broadcast_to(perms_k[:, :, None],       (M, K, B))
-    x_shuf = jnp.take_along_axis(x_batches, gather_idx_k_x, axis=1)
-    y_shuf = jnp.take_along_axis(y_batches, gather_idx_k_y, axis=1)
+    for seed_group in chunks(cfg.random_seeds, seed_chunk_size):
+        print(f"\n=== Training seed group: {seed_group} ===")
 
-    if not shuffle_within_batch:
-        return x_shuf, y_shuf
-
-    # 2) shuffle samples within each batch (axis=2)
-    perms_b = jnp.stack(
-        [jax.random.permutation(jax.random.fold_in(jax.random.PRNGKey(s ^ 0xBEEF), epoch), B)
-         for s in seeds],
-        axis=0
-    )  # (M, B)
-
-    gather_idx_b_x = jnp.broadcast_to(perms_b[:, None, :, None], (M, K, B, 1))
-    gather_idx_b_y = jnp.broadcast_to(perms_b[:, None, :],       (M, K, B))
-    x_shuf = jnp.take_along_axis(x_shuf, gather_idx_b_x, axis=2)
-    y_shuf = jnp.take_along_axis(y_shuf, gather_idx_b_y, axis=2)
-
-    return x_shuf, y_shuf
-
-def make_full_eval_grid(p: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    G, _ = DFT.make_irreps_Dn(p)
-    idx = {g: i for i, g in enumerate(G)}
-    group_size = len(G)
-    x_eval = jnp.array([[idx[g], idx[h]] for g in G for h in G], dtype=jnp.int32)
-    y_eval = jnp.array([idx[dihedral.mult(g, h, p)] for g in G for h in G], dtype=jnp.int32)
-    return x_eval, y_eval
-
-def pad_to_batches(x_eval, y_eval, batch_size: int, num_models: int):
-    x_exp = jnp.tile(x_eval[None, :, :], (num_models, 1, 1))
-    y_exp = jnp.tile(y_eval[None, :], (num_models, 1))
-    total, bs = x_eval.shape[0], batch_size
-    n_full, remain = total // bs, total % bs
-    if remain > 0:
-        pad = bs - remain
-        x_pad = x_exp[:, :pad, :]
-        y_pad = y_exp[:, :pad]
-        x_eval_padded = jnp.concatenate([x_exp, x_pad], axis=1)
-        y_eval_padded = jnp.concatenate([y_exp, y_pad], axis=1)
-        n_batches = n_full + 1
-    else:
-        x_eval_padded, y_eval_padded, n_batches = x_exp, y_exp, n_full
-    x_batches = x_eval_padded.reshape(num_models, n_batches, bs, 2)
-    y_batches = y_eval_padded.reshape(num_models, n_batches, bs)
-    return x_batches, y_batches
-
-# ---------------- Create TrainState ----------------
-
-def create_states(model, tx, weight_decay: float, batch_size: int, random_seed_ints: List[int]):
-    dummy_x = jnp.zeros((batch_size, 2), dtype=jnp.int32)
-    variables_list = [model.init(jax.random.PRNGKey(seed), dummy_x, training=False)
-                      for seed in random_seed_ints]
-    params_batch = jax.tree_util.tree_map(lambda *args: jnp.stack(args),
-                                          *(v['params'] for v in variables_list))
-
-    # independent init, every model's opt_state
-    def init_opt(p): return tx.init(p)
-    opt_states = []
-    for i in range(len(random_seed_ints)):
-        params_i = jax.tree_util.tree_map(lambda x: x[i], params_batch)
-        opt_states.append(init_opt(params_i))
-    opt_state_batch = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *opt_states)
-
-    apply = apply_fn_builder(model)
-    def loss_fn(y_pred_and_l2, y): return total_loss(y_pred_and_l2, y, weight_decay)
-
-    states_list = []
-    for i, seed in enumerate(random_seed_ints):
-        rng_key = jax.random.PRNGKey(seed)
-        params_i = jax.tree_util.tree_map(lambda x: x[i], params_batch)
-        opt_state_i = jax.tree_util.tree_map(lambda x: x[i], opt_state_batch)
-        state = training.TrainState(
-            apply_fn=apply, params=params_i, tx=tx, opt_state=opt_state_i,
-            loss_fn=loss_fn, loss_hessian_fn=lambda *_: (0.0, 0.0, 0.0),
-            compute_metrics_fn=compute_metrics,
-            rng_key=rng_key, initial_metrics=Metrics, batch_stats=None, injected_noise=0.0
+        # ---- Prep: dataset / model+opt / states ----
+        # Use explicit train/test batch builders (transformer prep module)
+        (
+            train_ds_list,
+            x_train_batches,
+            y_train_batches,
+            x_test_batches,
+            y_test_batches,
+        ) = prep.make_train_and_test_batches(
+            p=cfg.p,
+            batch_size=cfg.batch_size,
+            k=cfg.k,
+            random_seed_ints=seed_group,
+            test_batch_size=None,     # default = train batch size
+            shuffle_test=False,       # stable test ordering like MLP runner
+            drop_remainder=False,     # keep all test samples
         )
-        states_list.append(state)
+        print("made dataset")
 
-    states = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *states_list)
-    init_metrics = jax.tree_util.tree_map(lambda *args: jnp.stack(args),
-                                          *[s.initial_metrics.empty() for s in states_list])
-    return states, init_metrics
+        model = prep.build_model(cfg, group_size)
+        print("model made")
+        tx = prep.build_optimizer(cfg.optimizer, cfg.learning_rate)
+        states, init_metrics = prep.create_states(
+            model, tx, cfg.weight_decay, cfg.batch_size, seed_group
+        )
 
-# ---------------- JIT train/eval epoch ----------------
-# same as MLP included for future references
+        # Eval fn if you ever want the callable path; here we use eval_batches below
+        def eval_fn(current_states):
+            return prep.eval_model(current_states, x_test_batches, y_test_batches, init_metrics)
 
-@jax.jit
-def train_epoch(states, x_batches, y_batches, initial_metrics):
-    def train_step(state_metrics, batch):
-        states, metrics_ = state_metrics
-        x, y = batch
-        new_states, new_metrics = jax.vmap(
-            lambda st, m, xb, yb: st.train_step(m, (xb, yb)),
-            in_axes=(0, 0, 0, 0)
-        )(states, metrics_, x, y)
-        return (new_states, new_metrics), None
+        # ---- Train with periodic eval & extra logging (scaling runner) ----
+        states, logs_by_seed, first_100, first_loss, first_ce = wta.run_epochs_scaling(
+            model=model,                    # <- needed for Dirichlet auto-dispatch
+            states=states,
+            x_batches=x_train_batches,
+            y_batches=y_train_batches,
+            init_metrics=init_metrics,
+            random_seed_ints=seed_group,
+            weight_decay=cfg.weight_decay,
+            epochs=cfg.epochs,
+            eval_batches=(x_test_batches, y_test_batches),   # like MLP runner
+            eval_every=1,
+            # You could pass eval_fn=eval_fn instead of eval_batches if preferred
+        )
 
-    initial_state_metrics = (states, initial_metrics)
-    transposed_x = x_batches.transpose(1, 0, 2, 3)
-    transposed_y = y_batches.transpose(1, 0, 2)
-    (new_states, new_metrics), _ = jax.lax.scan(
-        train_step, 
-        initial_state_metrics, 
-        (transposed_x, transposed_y)
-    )
-    return new_states, new_metrics
+        # ---- Save per-epoch logs (same architecture as MLP) ----
+        # MLP uses pta.save_epoch_logs(mdir, ...). We mirror that structure:
+        # mdir/logs_<key>=<value>/epochs_seed_<seed>.json + final_summary.json
+        logs_root = os.path.join(mdir, f"logs_dmodel={cfg.d_model}")
+        os.makedirs(logs_root, exist_ok=True)
 
-@jax.jit
-def eval_model(states, x_batches, y_batches, initial_metrics):
-    def eval_step(metrics_, batch):
-        x, y = batch
-        new_metrics = jax.vmap(
-            lambda st, m, xb, yb: st.eval_step(m, (xb, yb)),
-            in_axes=(0, 0, 0, 0)
-        )(states, metrics_, x, y)
-        return new_metrics, None
+        for seed, logs in logs_by_seed.items():
+            out = os.path.join(logs_root, f"epochs_seed_{seed}.json")
+            with open(out, "w") as f:
+                json.dump(logs, f, indent=2)
+            print(f"[saved] {out}")
 
-    transposed_x = x_batches.transpose(1, 0, 2, 3)
-    transposed_y = y_batches.transpose(1, 0, 2)
-    final_metrics, _ = jax.lax.scan(
-        eval_step, 
-        initial_metrics, 
-        (transposed_x, transposed_y)
-    )
-    return final_metrics
+        # ---- Final eval summary (per-seed), same idea as MLP’s pta.final_eval_all_models ----
+        te = eval_fn(states)
+        summary: Dict[int, Dict] = {}
+        for i, seed in enumerate(seed_group):
+            mi = jax.tree_util.tree_map(lambda x: x[i], te).compute()
+            summary[seed] = dict(
+                loss=float(mi["loss"]),
+                l2_loss=float(mi["l2_loss"]),
+                accuracy=float(mi["accuracy"]),
+            )
+            print(
+                f"[Seed {seed}] Final Test: loss={summary[seed]['loss']:.6f} "
+                f"acc={summary[seed]['accuracy']*100:.2f}% "
+                f"l2={summary[seed]['l2_loss']:.6f}"
+            )
+
+        final_path = os.path.join(logs_root, "final_summary.json")
+        # If multiple chunks run, merge/append results across chunks
+        if os.path.exists(final_path):
+            with open(final_path, "r") as f:
+                prev = json.load(f)
+        else:
+            prev = {}
+        prev.update(summary)
+        with open(final_path, "w") as f:
+            json.dump(prev, f, indent=2)
+        print(f"[saved] {final_path}")
+
+        # ---- Free memory between chunks (like MLP runner) ----
+        del states, x_train_batches, y_train_batches, x_test_batches, y_test_batches
+        gc.collect()
+        jax.clear_caches()
+
+    print("\nAll seed groups completed.")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

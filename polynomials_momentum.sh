@@ -3,8 +3,8 @@
 #SBATCH --output=/home/mila/w/weis/scratch/DL/hypersearch/b%j.txt
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=30Gb
-#SBATCH --time=24:00:00
+#SBATCH --mem=50Gb
+#SBATCH --time=72:00:00
 #SBATCH --gres=gpu:rtx8000:1
 
 # polynomials_momentum.sh

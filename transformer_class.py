@@ -14,7 +14,7 @@ class HookPoint(nn.Module):
     key : str | None
         Optional explicit name.  If None we fall back to the module’s
         scope path, e.g. "blocks_0/mlp/hook_pre".
-    """
+    """ 
     key: str | None = None
 
     @nn.compact
@@ -383,6 +383,7 @@ class TransformerTwoEmbed(nn.Module):
         else:
             raise ValueError(f"x_emb must be (2,D) or (1,2,D), got {x_emb.shape}")
         return self.call_from_embedding_sequence(seq_emb, params)[0, -1]
+
 
     def extract_embeddings_ab(self, params):
         Wa = _find_embed_weight(params["embed_a"])

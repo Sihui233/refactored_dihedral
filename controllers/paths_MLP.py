@@ -8,7 +8,7 @@ import os
 
 # hypertuning
 def base_dir(p: int, mlp_class_lower: str, num_neurons: int, features: int, k: int) -> str:
-    d = f"/home/mila/w/weis/scratch/DL/MLP_dihedral/hypertuning/qualitative_{p}_{mlp_class_lower}_{num_neurons}_features_{features}_k_{k}"
+    d = f"/home/mila/w/weis/scratch/DL/MLP_dihedral/hypertuning1/qualitative_{p}_{mlp_class_lower}_{num_neurons}_features_{features}_k_{k}"
     os.makedirs(d, exist_ok=True)
     return d
 

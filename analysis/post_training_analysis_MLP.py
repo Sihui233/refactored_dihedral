@@ -49,7 +49,6 @@ def save_epoch_logs(log_by_seed: Dict[int, Dict[int, Dict]], out_dir: str, featu
         
         
 
-
 def get_all_preacts_and_embeddings(
         *,                        
         model: DonutMLP,
@@ -260,9 +259,9 @@ def run_post_training_analysis(*,
     freq_map = {}
     for name, dim, R, freq in irreps:
         freq_map[name] = freq
-        print(f"Checking {name}...")
+        # print(f"Checking {name}...")
         
-        dihedral.check_representation_consistency(G, R, dihedral.mult, p)
+        # dihedral.check_representation_consistency(G, R, dihedral.mult, p)
     rho_cache = DFT.build_rho_cache(G, irreps)
     dft_fn    = DFT.jit_wrap_group_dft(rho_cache, irreps, group_size)
     # subgroups = dihedral.enumerate_subgroups_Dn(p)
@@ -285,7 +284,7 @@ def run_post_training_analysis(*,
 
         # cluster + report generation
         layers_freq: List[Dict[int, list]] = []  # each layer：freq -> [neuron ids]
-        cluster_tau = 1e-3
+        # cluster_tau = 1e-3
         thresh_small = 2.0 if group_size < 50 else 3.0
 
         for layer_idx in range(num_layers):
@@ -298,8 +297,8 @@ def run_post_training_analysis(*,
             )
 
             # per layer cluster based on freq
-            clusters_layer = artifacts["freq_cluster"]  # {freq: [neuron ids]}
-            layers_freq.append(clusters_layer)
+            # clusters_layer = artifacts["freq_cluster"]  # {freq: [neuron ids]}
+            # layers_freq.append(clusters_layer)
 
             # approx summary per layer
             diag_labels = artifacts["diag_labels"]

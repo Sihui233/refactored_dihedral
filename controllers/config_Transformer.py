@@ -24,7 +24,6 @@ class Config:
     attn_coeff: float
     nn_multiplier: int
     num_mlp_layers: int
-    eval_every: int = 1  # 默认每个 epoch 评估一次
 
     @classmethod
     def from_argv(cls, argv: list[str]) -> "Config":
@@ -57,6 +56,5 @@ class Config:
             attn_coeff=float(argv[14]),
             nn_multiplier=int(argv[15]),
             num_mlp_layers=int(argv[16]),
-            eval_every=int(argv[17]),
-            random_seeds=[int(x) for x in argv[18:]],
+            random_seeds=[int(x) for x in argv[17:]],
         )
