@@ -117,14 +117,14 @@ def build_optimizer(optimizer_name: str, lr: float):
 
 #     return train_ds_list, x_batches, y_batches
 
-# def make_full_eval_grid(p: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-#     """Build (|G|^2, 2) inputs and labels for D_n group multiplication."""
-#     G, _ = DFT.make_irreps_Dn(p)
-#     idx = {g: i for i, g in enumerate(G)}
-#     group_size = len(G)
-#     x_eval = jnp.array([[idx[g], idx[h]] for g in G for h in G], dtype=jnp.int32)
-#     y_eval = jnp.array([idx[dihedral.mult(g, h, p)] for g in G for h in G], dtype=jnp.int32)
-#     return x_eval, y_eval  # shapes: (4p^2,2), (4p^2,)
+def make_full_eval_grid(p: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Build (|G|^2, 2) inputs and labels for D_n group multiplication."""
+    G, _ = DFT.make_irreps_Dn(p)
+    idx = {g: i for i, g in enumerate(G)}
+    group_size = len(G)
+    x_eval = jnp.array([[idx[g], idx[h]] for g in G for h in G], dtype=jnp.int32)
+    y_eval = jnp.array([idx[dihedral.mult(g, h, p)] for g in G for h in G], dtype=jnp.int32)
+    return x_eval, y_eval  # shapes: (4p^2,2), (4p^2,)
 
 # def pad_to_batches(x_eval, y_eval, batch_size: int, num_models: int):
 #     """Tile eval to all models and pad to whole batches."""

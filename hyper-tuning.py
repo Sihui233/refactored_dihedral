@@ -141,8 +141,8 @@ def main():
         # 依次计算该组合的派生参数
         bs = batch_size_for_p(p)
         k = compute_k(p)
-        # num_neurons = compute_num_neurons(p)
-        num_neurons = 10000
+        
+        num_neurons = min( compute_num_neurons(p), 10000)
         seeds = [str(s) for s in SEEDS]
 
         # —— 准备 argv（严格按 Config.from_argv 的顺序）——

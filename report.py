@@ -98,17 +98,34 @@ def dominant_freqs_ab(grid: np.ndarray) -> Tuple[int, int]:
     p = grid.shape[0]
     F = np.fft.fft2(grid)
     F_mag = np.abs(F) ** 2              # energy spectrum
-    F_mag[0, 0] = 0                     # suppress DC
+    F_mag[0, 0] = -np.inf                   # suppress DC
 
     # Row 0   → k_y = 0  (horizontal variations only)
     # Column 0→ k_x = 0  (vertical   variations only)
     half = p // 2
-    row0 = F_mag[0, :half+1].copy()
-    col0 = F_mag[:half+1, 0].copy()
-    row0[0] = col0[0] = 0               # avoid picking DC twice
+    row0 = F_mag[0, :half+1].copy() if half >= 0 else np.array([])
+    col0 = F_mag[:half+1, 0].copy() if half >= 0 else np.array([])
+    if row0.size: row0[0] = -np.inf
+    if col0.size: col0[0] = -np.inf
 
-    fb = int(np.argmax(row0))           # horizontal (b)
-    fa = int(np.argmax(col0))           # vertical   (a)
+    fb_idx = int(np.argmax(row0)) if row0.size else 0
+    fa_idx = int(np.argmax(col0)) if col0.size else 0
+    axis_best = max(float(row0[fb_idx]) if row0.size else -np.inf,
+                    float(col0[fa_idx]) if col0.size else -np.inf)
+    ks = np.arange(1, half+1, dtype=int)
+    diag_vals = F_mag[ks, ks] if ks.size else np.array([])
+    if diag_vals.size:
+        best_k_diag = int(ks[int(np.argmax(diag_vals))])
+        diag_best = float(np.max(diag_vals))
+    else:
+        best_k_diag, diag_best = 0, -np.inf
+
+    if diag_best > axis_best:
+        fdiag = best_k_diag if best_k_diag > 0 else 1
+        return fdiag, fdiag
+
+    fb = fb_idx if fb_idx > 0 else 1
+    fa = fa_idx if fa_idx > 0 else 1
     return fb, fa
 
 # ── helper: remap one p×p quadrant by (freq * a, freq * b) mod p ────────────
@@ -233,7 +250,7 @@ def _quadrant_ab_phases(grid: np.ndarray) -> List[Tuple[float, float]]:
 
     The grid is split into BL / BR / TL / TR.  For each quadrant we detect
     the dominant *b* and *a* frequencies separately, then call
-    ``single_freq_phase_shifts_ab`` to get the raw phases.
+    `single_freq_phase_shifts_ab to get the raw phases.
 
     Returns
     -------
@@ -514,6 +531,9 @@ def quad_set_extrema_records_strict_f(
         return dict(ok=False, reason=f"f varies across quads: {f_list} (uniq={uniq})", f=None, g=None, records=[])
 
     f = uniq[0]
+    if f == 0:
+        return dict(ok=False, reason=f"dominant frequency is DC (f=0) for n={n}",
+                f=0, g=None, records=[])
     if (p % f) != 0:
         return dict(ok=False, reason=f"p({p}) not divisible by f({f})", f=None, g=None, records=[])
 
@@ -1186,14 +1206,13 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
     # 1) DFT once
     flat_all = pre_grid.reshape(G*G, N)
     F_full   = dft_2d(flat_all)
-    # F_L      = dft_2d(left)
-    # F_R      = dft_2d(right)
+    F_L      = dft_2d(left)
+    F_R      = dft_2d(right)
 
     # 2) cluster
     names = [lab for lab, _, _, _ in irreps]
     irrep2neurons = defaultdict(list)
-    # freq_cluster  = defaultdict(list)   # 记录所有 neuron（r==s）
-    diag_labels   = set()               # 将在 prune 之后重建
+    freq_cluster  = defaultdict(list) 
     # neuron2pair   = {}
 
     # freq_clust_2d = {
@@ -1210,17 +1229,6 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
         r_star, s_star = dom["r_star"], dom["s_star"]
         irrep2neurons[(r_star, s_star)].append(n)
         # neuron2pair[n] = (r_star, s_star)
-
-        # # freq_cluster：全量记录（r==s）
-        # if r_star == s_star:
-        #     if r_star not in freq_map:
-        #         if strict:
-        #             raise KeyError(f"freq_map no mapping for irrep '{r_star}'")
-        #         else:
-        #             # skip unknown label
-        #             continue
-        #     f = int(freq_map[r_star])
-        #     freq_cluster[f].append(int(n))
 
         # # freq_clust_2d：保持原逻辑
         # if dom["kind"] == "diag" and dom["fa"] is not None:
@@ -1250,6 +1258,8 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
     for k, v in irrep2neurons.items():
         irrep2neurons[k] = list(dict.fromkeys(v))
 
+    # === diag_labels contains only main neurons===
+    diag_labels = set()
     cluster_prune = {}   # (r,s) -> {"main": [global_n...], "drop": [global_n...], "per_neuron_log10": {n: val}}
     if prune_cfg is not None:
         t1 = float(prune_cfg.get("thresh1", 2.0))
@@ -1274,31 +1284,42 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
             drop = [int(neuron_list[i]) for i in drop_rel]
             per_log = {int(neuron_list[i]): float(log_mp[i]) for i in range(log_mp.size)}
             cluster_prune[(r, s)] = {"main": main, "drop": drop, "per_neuron_log10": per_log}
-
-    # === diag_labels contains only main neurons===
-    diag_labels = set()
-    if prune_cfg is not None:
-        # 只统计 main（不计 drop）
-        for (r, s), pr in cluster_prune.items():
-            if r != s:
-                continue
-            for n in pr.get("main", []):
-                kind_n = neuron_data[int(n)]["dominant"]["kind"]
-                diag_labels.add((r, kind_n))
+            # build pruned freq_cluster and diag_labels inline
+            if r not in freq_map:
+                if strict:
+                    raise KeyError(f"freq_map has no mapping for irrep '{r}'")
+            else:
+                f = int(freq_map[r])
+                freq_cluster[f].extend(main)
+                for n in main:
+                    kind_n = neuron_data[n]["dominant"]["kind"]
+                    diag_labels.add((r, kind_n))
+            
     else:
-        # 未启用 prune：按全部神经元统计
+        # no pruning: build freq_cluster & diag_labels in one pass
         for (r, s), neuron_list in irrep2neurons.items():
-            if r != s:
+            if r != s or not neuron_list:
                 continue
+            if r not in freq_map:
+                if strict:
+                    raise KeyError(f"freq_map has no mapping for irrep '{r}'")
+                else:
+                    continue
+            f = int(freq_map[r])
+            freq_cluster[f].extend(neuron_list)
             for n in neuron_list:
                 kind_n = neuron_data[int(n)]["dominant"]["kind"]
                 diag_labels.add((r, kind_n))
 
+    # de-dup freq_cluster lists, preserving order
+    freq_cluster = {f: list(dict.fromkeys(ids)) for f, ids in freq_cluster.items() if ids}
+
     artifacts = {
-        "F_full": F_full, # "F_L": F_L, "F_R": F_R,
+        "F_full": F_full, 
+        #"F_L": F_L, "F_R": F_R,
         "names": names,
         "irrep2neurons": irrep2neurons,
-        # "freq_cluster": freq_cluster,        # includes both main and drop
+        "freq_cluster": freq_cluster,        # includes both main and drop
         # "freq_clust_2d": freq_clust_2d,
         "diag_labels": diag_labels,          # only main
         # "neuron2pair": neuron2pair,
@@ -2382,6 +2403,3 @@ def build_neuron_page_json(
     }
     }
     return data
-
-
-    
