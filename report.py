@@ -1316,7 +1316,7 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
 
     artifacts = {
         "F_full": F_full, 
-        #"F_L": F_L, "F_R": F_R,
+        "F_L": F_L, "F_R": F_R,
         "names": names,
         "irrep2neurons": irrep2neurons,
         "freq_cluster": freq_cluster,        # includes both main and drop

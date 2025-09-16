@@ -1,10 +1,11 @@
+import os
+os.environ["JAX_ENABLE_X64"] = "1"
+
 import jax
 import jax.numpy as jnp
 from typing import Dict, Tuple
 from functools import partial
 import numpy as np
-import os
-os.environ["JAX_ENABLE_X64"] = "1"
 
 def make_irreps_Dn(n):
     """

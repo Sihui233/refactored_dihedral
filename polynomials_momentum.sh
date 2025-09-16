@@ -31,6 +31,14 @@ source /home/mila/w/weis/DL/.env/bin/activate
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$CUDA_HOME/extras/CUPTI/lib64:$LD_LIBRARY_PATH
 export CPATH=$CUDA_HOME/include:$HOME/.local/include:$CPATH
 export LD_LIBRARY_PATH=$HOME/.local/lib:$LD_LIBRARY_PATH
+# Don’t pre-grab all VRAM; leave space for autotuner / spikes
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# (optional) cap the client memory fraction if you still see fragmentation
+export XLA_PYTHON_CLIENT_MEM_FRACTION=.90
+
+# Reduce autotuning memory (the log even suggested this)
+export XLA_FLAGS="--xla_gpu_autotune_level=3"
+
 # === Change to working directory ===
 cd /home/mila/w/weis/DL/refactored_dihedral
 

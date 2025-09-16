@@ -11,4 +11,4 @@
 # python3 train_mlp_multilayer_dirichlet_bs_metrics_added.py 0.001 0.0001 18 18 adam 2500 18 random_random 128 one_embed 128 1 0 1 2 3 4
 
 # python3 -m run.run_training_MLP 0.001 0.0001 4 8 adam 2500 8 random_random 128 two_embed 128 2 0
-python3 -m run.run_training_MLP 0.001 0.0001 18 36 adam 500 28 random_random 128 two_embed 128 2 0
+python3 -m run.run_training_MLP 0.001 0.0001 18 36 adam 500 28 random_random 256 two_embed 128 2 0

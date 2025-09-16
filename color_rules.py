@@ -387,6 +387,89 @@ def colour_quad_b_only(
     cmap = build_ro_scale(g) if is_rain else build_vi_scale(p)
     return colour, caption, int(colour.max())+1, cmap
 
+def colour_quad_a_only_no_fb(
+    a: np.ndarray | list[int],
+    b: np.ndarray | list[int], 
+    p: int,
+    f: int,
+    tag: str,                    # Quadrant | "full"
+):
+    g = p // math.gcd(p, f) if math.gcd(p, f) != 0 else p
+
+    a = np.asarray(a, int)
+    b = np.asarray(b, int)
+
+    if tag == "full":
+        A = a % p
+        colour = A % g
+    else:
+        colour = a % g
+
+    caption = f"a mod {g}"
+    pbar = int(g)
+
+    return colour, caption, pbar, _DEFAULT
+
+def colour_quad_b_only(
+    a: np.ndarray | list[int],
+    b: np.ndarray | list[int],
+    p: int,
+    f: int,
+    tag: Quadrant,
+) -> Tuple[np.ndarray, str, int]:
+    g = p // math.gcd(p, f) if math.gcd(p, f) != 0 else p
+
+    a = np.asarray(a, int)
+    b = np.asarray(b, int)
+
+    if tag == "full":
+        A, B = a, b
+        top, right = A >= p, B >= p
+        is_rain = (top & (~right)) | ((~top) & right)   # TL / BR
+
+        # first bring to local 0…p‑1 *if* coordinates are global
+        base_local = B % p
+        base = base_local % g
+        
+        colour = np.where(is_rain, g + base, base)
+        caption = (
+            f"Viridis dark (BL/TR): a mod {g}; "
+            f"Viridis bright (BR/TL): a mod {g}"
+        )
+        return colour, caption, 2 * g, build_split_scale_red_orange(g)
+
+    # single quadrant – decide if this one is Rainbow or Viridis
+    is_rain = tag in ("BR", "TL")
+    base = np.asarray(b) % g  # gcd g divides p ⇒ direct mod suffices
+    colour = base
+    caption = f"b mod {g}  ({'Viridis bright' if is_rain else 'Viridis dark'})"
+    cmap = build_ro_scale(g) if is_rain else build_vi_scale(p)
+    return colour, caption, int(colour.max())+1, cmap
+
+def colour_quad_b_only_no_fb(
+    a: np.ndarray | list[int],
+    b: np.ndarray | list[int], 
+    p: int,
+    f: int,
+    tag: str,                    # Quadrant | "full"
+):
+    g = p // math.gcd(p, f) if math.gcd(p, f) != 0 else p
+
+    a = np.asarray(a, int)
+    b = np.asarray(b, int)
+
+    if tag == "full":
+        B = b % p
+        colour = B % g
+    else:
+        colour = b % g
+
+    caption = f"b mod {g}"
+    pbar = int(g)
+
+    return colour, caption, pbar, _DEFAULT
+
+
 def lines_a_mod_g(a_vals, b_vals,p,g):
     h_pairs = []
     for b_fix in list(range(g)) + [p + i for i in range(g)]:
