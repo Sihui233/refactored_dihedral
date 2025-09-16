@@ -1,4 +1,4 @@
-# analysis/while_training_analysis_MLP.py
+# analysis/while_training_analysis_gen.py
 from typing import Dict, List, Tuple, Optional, Callable, Any
 import jax
 import jax.numpy as jnp
@@ -45,153 +45,6 @@ def build_margin_fn(model, *, chunk_size: int = 8192):
         return float(gmin), float(total / N)
 
     return margin_stats
-
-
-
-# # ---------------- Dirichlet energy (MLP) — low-memory ----------------
-# def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
-#     """
-#     Build the first-layer input embedding for an MLP model.
-#     Tries to infer whether the first layer expects concat/add embeddings or one-hot.
-
-#     x: (B,2) int32 of indices (a,b)
-#     """
-#     a, b = x[:, 0], x[:, 1]
-
-#     def _find_first_dense_kernel(params_tree):
-#         for k, v in params_tree.items():
-#             if isinstance(v, dict):
-#                 if "kernel" in v:
-#                     return v["kernel"]
-#                 out = _find_first_dense_kernel(v)
-#                 if out is not None:
-#                     return out
-#         return None
-
-#     if hasattr(model, "extract_embeddings_ab"):
-#         Wa, Wb = model.extract_embeddings_ab(params)  # (group_size, D_a), (group_size, D_b)
-#         Da, Db = Wa.shape[1], Wb.shape[1]
-#         k0 = _find_first_dense_kernel(params)
-#         if k0 is None:
-#             # Fallback: add embeddings if we cannot infer input size
-#             return Wa[a] + Wb[b]
-#         in_features = k0.shape[0]
-#         p_vocab = Wa.shape[0]
-
-#         # Concat learned embeddings
-#         if in_features == Da + Db:
-#             return jnp.concatenate([Wa[a], Wb[b]], axis=1)
-#         # Add learned embeddings
-#         if in_features == Da:
-#             return Wa[a] + Wb[b]
-#         # One-hot concat
-#         if in_features == 2 * p_vocab:
-#             return jnp.concatenate(
-#                 [jax.nn.one_hot(a, p_vocab), jax.nn.one_hot(b, p_vocab)], axis=1
-#             ).astype(jnp.float32)
-#         # One-hot addition
-#         if in_features == p_vocab:
-#             return (jax.nn.one_hot(a, p_vocab) + jax.nn.one_hot(b, p_vocab)).astype(jnp.float32)
-
-#         # Last resort
-#         return Wa[a] + Wb[b]
-#     else:
-#         # No extract_embeddings_ab → assume one-hot style first layer
-#         k0 = _find_first_dense_kernel(params)
-#         if k0 is None:
-#             raise ValueError("Cannot infer first-layer input size for embeddings.")
-#         in_features = k0.shape[0]
-#         p_guess = int(jnp.max(jnp.concatenate([a, b])) + 1)
-#         if in_features == 2 * p_guess:
-#             return jnp.concatenate(
-#                 [jax.nn.one_hot(a, p_guess), jax.nn.one_hot(b, p_guess)], axis=1
-#             ).astype(jnp.float32)
-#         if in_features == p_guess:
-#             return (jax.nn.one_hot(a, p_guess) + jax.nn.one_hot(b, p_guess)).astype(jnp.float32)
-#         raise ValueError("Unsupported first-layer input format.")
-    
-# def make_energy_funcs_MLP(model, params: dict, *, num_probes: int = 1):
-#     """
-#     不再构造显式 Jacobian。
-#     用 Hutchinson trick：E_v ||J v||^2 = ||J||_F^2，其中 v~N(0, I_D)。
-#     这样只用到 JVP，不会产生 (C,D) 的大张量。
-#     """
-#     def f_embed(x_embed: jnp.ndarray) -> jnp.ndarray:
-#         logits, _ = model.call_from_embedding(x_embed, params)
-#         return logits  # (C,)
-
-#     # 单样本 energy：平均 num_probes 次随机方向的 ||J v||^2
-#     def _energy_single(x_embed: jnp.ndarray, key: Any) -> jnp.ndarray:
-#         def _one_probe(k):
-#             v = jax.random.normal(k, x_embed.shape)  # (D,)
-#             # jvp 返回 (f(x), J v)，我们只要 J v
-#             jv = jax.jvp(f_embed, (x_embed,), (v,))[1]  # (C,)
-#             return jnp.vdot(jv, jv)  # ||J v||^2
-
-#         keys = jax.random.split(key, num_probes)
-#         vals = jax.vmap(_one_probe)(keys)
-#         return jnp.mean(vals)
-
-#     _energy_single = jax.jit(_energy_single)
-
-#     @jax.jit
-#     def batch_energy_sum(batch_emb: jnp.ndarray, key: Any) -> jnp.ndarray:
-#         # 为 batch 中每个样本分一个子 key
-#         keys = jax.random.split(key, batch_emb.shape[0])
-#         energies = jax.vmap(_energy_single)(batch_emb, keys)  # (B,)
-#         return jnp.sum(energies)  # Σ ||J||_F^2 (Hutchinson 估计)
-
-#     def emb_fn(x_data: jnp.ndarray) -> jnp.ndarray:
-#         return compute_embeddings_MLP(model, params, x_data)
-
-#     return emb_fn, batch_energy_sum
-
-# def select_num_probes_by_group_size(group_size: int) -> int:
-#     """
-#     经验阈值（全网格/较大样本时很稳）：
-#       N >= 289  -> 1
-#       81 <= N < 289 -> 2
-#       25 <= N < 81  -> 4
-#       N < 25        -> 8
-#     理由：Hutchinson 方差 ~ 1/sqrt(N * K)。组越大，需要的 K 越小。
-#     """
-#     if group_size >= 289:
-#         return 1
-#     if group_size >= 81:
-#         return 2
-#     if group_size >= 25:
-#         return 4
-#     return 8
-
-# def compute_dirichlet_energy_embedding_MLP(
-#     model,
-#     params: dict,
-#     x_data: jnp.ndarray,           # (N,2)
-#     *,
-#     chunk_size: int = 2048,        # 更保守的缺省
-#     num_probes: int = 1,
-#     key: Optional[Any] = None,
-# ) -> float:
-#     """
-#     流式计算：不再一次性 materialize 整个 emb。
-#     """
-#     # 复用上面的低内存实现
-#     N = x_data.shape[0]
-#     if N == 0:
-#         return 0.0
-#     num_probes_calc = select_num_probes_by_group_size(N)
-#     num_probes = max(int(num_probes), int(num_probes_calc))
-#     num_probes = int(jnp.clip(num_probes, 1, 8))
-#     emb_fn, batch_energy_sum = make_energy_funcs_MLP(model, params, num_probes=num_probes)
-#     if key is None:
-#         key = jax.random.PRNGKey(0)
-    
-#     total = jnp.array(0.0)
-#     for s in range(0, N, chunk_size):
-#         e_batch = emb_fn(x_data[s:s + chunk_size])       # (b, D)
-#         key, sub = jax.random.split(key)
-#         total = total + batch_energy_sum(e_batch, sub)
-#     return float(total / N)
 
 # # ---------------- Dirichlet energy (MLP) ----------------
 def compute_embeddings_MLP(model, params: dict, x: jnp.ndarray) -> jnp.ndarray:
@@ -685,16 +538,16 @@ def run_epochs_scaling(*,
                     xs_eval_for_energy = None
 
                 # Dirichlet energies
-                if xs_eval_for_energy is not None:
-                    de_test = compute_dirichlet_energy_embedding_auto(
-                        model, params_i, xs_eval_for_energy, chunk_size=energy_chunk
-                    )
-                else:
-                    de_test = float("nan")
+                # if xs_eval_for_energy is not None:
+                #     de_test = compute_dirichlet_energy_embedding_auto(
+                #         model, params_i, xs_eval_for_energy, chunk_size=energy_chunk
+                #     )
+                # else:
+                #     de_test = float("nan")
 
-                de_train = compute_dirichlet_energy_embedding_auto(
-                    model, params_i, xb_i, chunk_size=energy_chunk
-                )
+                # de_train = compute_dirichlet_energy_embedding_auto(
+                #     model, params_i, xb_i, chunk_size=energy_chunk
+                # )
                 
 
                 logs_by_seed[seed].setdefault(epoch + 1, {})
@@ -710,15 +563,15 @@ def run_epochs_scaling(*,
                     "train_margin_avg": float(tr_avg_m),
                     "test_margin_min": float(min_m),
                     "test_margin_avg": float(avg_m),
-                    "dirichlet_energy_test":  float(de_test),
-                    "dirichlet_energy_train": float(de_train),
+                    # "dirichlet_energy_test":  float(de_test),
+                    # "dirichlet_energy_train": float(de_train),
                 })
 
                 print(
                     f"Seed {seed}: Test CE {test_ce:.6f}, Total {test_loss:.6f}, "
                     f"Acc {test_acc:.2%}, "
                     f"Margin[min/avg] {float(min_m):.4f}/{float(avg_m):.4f}, "
-                    f"DE[test/train/total] {de_test:.3e}/{de_train:.3e}"
+                    # f"DE[test/train/total] {de_test:.3e}/{de_train:.3e}"
                 )
 
                 if first_100[seed] is None and test_acc >= 1.0:
@@ -732,4 +585,3 @@ def run_epochs_scaling(*,
                     )
 
     return states, logs_by_seed, first_100, first_loss, first_ce
-

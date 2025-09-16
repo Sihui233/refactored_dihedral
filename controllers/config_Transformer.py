@@ -31,13 +31,13 @@ class Config:
         Usage:
           script.py <lr> <wd> <p> <batch_size> <optimizer> <epochs> <k> <batch_experiment>
                     <d_model> <d_head> <num_heads> <n_ctx> <act_type> <attn_coeff>
-                    <nn_multiplier> <num_mlp_layers> <eval_every> <seed1> [<seed2> ...]
+                    <nn_multiplier> <num_mlp_layers> <seed1> [<seed2> ...]
         """
-        if len(argv) < 19:
+        if len(argv) < 18:
             raise SystemExit(
                 "Usage: script.py <lr> <wd> <p> <batch_size> <optimizer> <epochs> <k> <batch_experiment> "
                 "<d_model> <d_head> <num_heads> <n_ctx> <act_type> <attn_coeff> "
-                "<nn_multiplier> <num_mlp_layers> <eval_every> <seed1> [<seed2> ...]"
+                "<nn_multiplier> <num_mlp_layers> <seed1> [<seed2> ...]"
             )
         return cls(
             learning_rate=float(argv[1]),
