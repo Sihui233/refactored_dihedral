@@ -537,7 +537,7 @@ def run_epochs_scaling(*,
                     min_m, avg_m = jnp.nan, jnp.nan
                     xs_eval_for_energy = None
 
-                # Dirichlet energies
+                # # Dirichlet energies
                 # if xs_eval_for_energy is not None:
                 #     de_test = compute_dirichlet_energy_embedding_auto(
                 #         model, params_i, xs_eval_for_energy, chunk_size=energy_chunk

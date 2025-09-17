@@ -4,7 +4,7 @@ from typing import List
 
 @dataclass
 class Config:
-    # 共用超参
+    # shared hyperparameters
     learning_rate: float
     weight_decay: float
     p: int
@@ -15,7 +15,7 @@ class Config:
     batch_experiment: str
     random_seeds: List[int]
 
-    # Transformer 专属
+    # Transformer special
     d_model: int
     d_head: int
     num_heads: int

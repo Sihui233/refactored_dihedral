@@ -2,7 +2,7 @@
 import os
 
 def base_dir(p: int, model_tag: str, d_model: int, k: int) -> str:
-    d = f"/home/mila/w/weis/scratch/DL/Transformer_dihedral/qualitative_{p}_{model_tag}_dmodel_{d_model}_k_{k}"
+    d = f"/home/mila/w/weis/scratch/DL/Transformer_dihedral/hypertuning1/qualitative_{p}_{model_tag}_dmodel_{d_model}_k_{k}"
     os.makedirs(d, exist_ok=True)
     return d
 

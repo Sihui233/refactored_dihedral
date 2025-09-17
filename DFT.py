@@ -2,6 +2,9 @@ import os
 os.environ["JAX_ENABLE_X64"] = "1"
 
 import jax
+from jax import config
+config.update("jax_default_matmul_precision", "high")  # 或 "highest"
+
 import jax.numpy as jnp
 from typing import Dict, Tuple
 from functools import partial
@@ -53,7 +56,6 @@ def build_rho_cache(G, irreps):
         for name, _, R, _ in irreps
     }
 
-
 # def _group_dft_preacts_inner(preacts, rho_cache, irreps, group_size):
     
 #     f_grid = preacts.reshape(group_size, group_size, -1)  # (|G|,|G|,N)
@@ -96,6 +98,27 @@ def build_rho_cache(G, irreps):
 #     # normalized by |G|^2
 #     gsq = group_size**2 # f_grid.shape[0] * f_grid.shape[0]
 #     return M / gsq
+
+# @partial(jax.jit, static_argnums=(3,))
+# def _einsum_block(f_grid, rho_r_dag, rho_s_dag, group_size):
+#     """
+#     f_grid:    (|G|, |G|, N)
+#     rho_r_dag: (|G|, d_r, d_r)
+#     rho_s_dag: (|G|, d_s, d_s)
+#     return:    (d_r, d_r, d_s, d_s, N)
+#     """
+#     # step1: sum over 'a' -> (d_r, d_r, |G|, N)
+#     #   'aij,abn->ijbn'
+#     tmp = jnp.einsum('aij,abn->ijbn', rho_r_dag, f_grid)
+
+#     # step2: sum over 'b' -> (d_r, d_r, d_s, d_s, N)
+#     #   'bkl,ijbn->ijkln'
+#     M = jnp.einsum('bkl,ijbn->ijkln', rho_s_dag, tmp)
+
+#     inv_gsq = jnp.asarray(1.0, dtype=M.dtype) / (group_size * group_size)
+#     return M * inv_gsq
+
+
 @partial(jax.jit, static_argnums=(3,))
 def _einsum_block(f_grid, rho_r_dag, rho_s_dag, group_size):
     """
@@ -104,16 +127,42 @@ def _einsum_block(f_grid, rho_r_dag, rho_s_dag, group_size):
     rho_s_dag: (|G|, d_s, d_s)
     return:    (d_r, d_r, d_s, d_s, N)
     """
-    # step1: sum over 'a' -> (d_r, d_r, |G|, N)
-    #   'aij,abn->ijbn'
-    tmp = jnp.einsum('aij,abn->ijbn', rho_r_dag, f_grid)
+    # --- 动态选择计算 dtype：复数→complex64，实数→float32 ---
+    need_complex = (
+        jnp.issubdtype(f_grid.dtype, jnp.complexfloating) or
+        jnp.issubdtype(rho_r_dag.dtype, jnp.complexfloating) or
+        jnp.issubdtype(rho_s_dag.dtype, jnp.complexfloating)
+    )
+    ctype = jnp.complex64 if need_complex else jnp.float32
 
-    # step2: sum over 'b' -> (d_r, d_r, d_s, d_s, N)
-    #   'bkl,ijbn->ijkln'
-    M = jnp.einsum('bkl,ijbn->ijkln', rho_s_dag, tmp)
+    G   = group_size
+    d_r = int(rho_r_dag.shape[1])
+    d_s = int(rho_s_dag.shape[1])
+    B   = int(f_grid.shape[-1])
 
-    inv_gsq = jnp.asarray(1.0, dtype=M.dtype) / (group_size * group_size)
-    return M * inv_gsq
+    f   = f_grid.astype(ctype)
+    Ar  = rho_r_dag.astype(ctype)
+    Bs  = rho_s_dag.astype(ctype)
+
+    # 展平到 GEMM 友好格式（两次 matmul 更快）
+    A_T    = Ar.reshape(G, d_r * d_r).T      # (d_r^2, G)
+    B_flat = Bs.reshape(G, d_s * d_s)        # (G, d_s^2)
+    F      = jnp.moveaxis(f, 2, 0)           # (B, G, G)
+
+    # 自适应更省 FLOPs 的乘法顺序
+    def path_AT_first(F_):
+        Z = jnp.matmul(A_T[None, ...], F_)   # (B, d_r^2, G)
+        return jnp.matmul(Z, B_flat)         # (B, d_r^2, d_s^2)
+    def path_B_first(F_):
+        Z = jnp.matmul(F_, B_flat)           # (B, G, d_s^2)
+        return jnp.matmul(A_T[None, ...], Z) # (B, d_r^2, d_s^2)
+
+    Mflat = jax.lax.cond(d_r <= d_s, path_AT_first, path_B_first, F)
+
+    # 归一化 + 还原形状
+    inv_gsq = jnp.asarray(1.0, dtype=ctype) / (G * G)
+    Mflat = jnp.moveaxis(Mflat * inv_gsq, 0, -1)    # (d_r^2, d_s^2, B)
+    return Mflat.reshape(d_r, d_r, d_s, d_s, B)
 
 # def _group_dft_preacts_inner_nojit(preacts, rho_cache, irreps, group_size):
 #     f_grid = jnp.asarray(preacts).reshape(group_size, group_size, -1)  # (|G|,|G|,N)
@@ -134,8 +183,7 @@ def _einsum_block(f_grid, rho_r_dag, rho_s_dag, group_size):
 #     return Fhat
 def _group_dft_preacts_inner_nojit(preacts, rho_cache, irreps, group_size):
     """
-    分块沿着 n 维计算，避免一次 materialize (d_r,d_r,d_s,d_s,N)。
-    计算后立即 device_get 到 CPU，避免 GPU 累积内存。
+    Batched along nto prevent materializing (d_r,d_r,d_s,d_s,N)。
     """
     f_grid = jnp.asarray(preacts).reshape(group_size, group_size, -1)  # (G,G,N)
     N = int(f_grid.shape[-1])
@@ -152,16 +200,24 @@ def _group_dft_preacts_inner_nojit(preacts, rho_cache, irreps, group_size):
 
     Fhat = {}
 
-    # 简单的自适应 chunk 估计：控制中间 tmp/M 的体积都不超过 ~256MB
-    TARGET_BYTES = 256 * 1024 * 1024
+    # 简单的自适应 chunk 估计：控制中间 tmp/M 的体积都不超过 ~500MB
+    TARGET_BYTES = 500 * 1024 * 1024
 
     for r_name, d_r, _, _ in irreps:
         rho_r_dag = rho_dag_cache[r_name]  # (G,d_r,d_r)
         for s_name, d_s, _, _ in irreps:
             rho_s_dag = rho_dag_cache[s_name]  # (G,d_s,d_s)
 
-            bytes_per_sample_out = d_r * d_r * d_s * d_s * 4  # float32 4B
-            bytes_per_sample_tmp = group_size * d_s * d_s * 4
+                        # —— 估算每样本内存（按实际 dtype 区分复/实）——
+            elem_bytes = 8 if (
+                jnp.issubdtype(f_grid.dtype, jnp.complexfloating) or
+                jnp.issubdtype(rho_r_dag.dtype, jnp.complexfloating) or
+                jnp.issubdtype(rho_s_dag.dtype, jnp.complexfloating)
+            ) else 4
+
+            # 输出/中间的保守估算（足够决定一个稳妥的 B）
+            bytes_per_sample_out = d_r * d_r * d_s * d_s * elem_bytes
+            bytes_per_sample_tmp = group_size * d_s * d_s * elem_bytes
             bytes_per_sample = max(bytes_per_sample_out, bytes_per_sample_tmp)
 
             if bytes_per_sample == 0:

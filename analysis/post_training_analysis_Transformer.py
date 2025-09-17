@@ -540,14 +540,14 @@ def run_post_training_analysis(
             with open(os.path.join(gdir, f"approx_summary_layer{layer_idx+1}_p{p}.json"), "w") as f:
                 json.dump(approx, f, indent=2)
 
-            # # commented out for scaling
-            # report_dir = os.path.join(gdir, f"report_layer{layer_idx+1}")
-            # os.makedirs(report_dir, exist_ok=True)
-            # report.make_layer_report(
-            #     prei_grid, pre_a_alive, pre_b_alive, p,
-            #     dft_fn, irreps, coset_masks_L, coset_masks_R,
-            #     report_dir, cluster_tau, colour_rule, artifacts,
-            # )
+            # commented out for scaling
+            report_dir = os.path.join(gdir, f"report_layer{layer_idx+1}")
+            os.makedirs(report_dir, exist_ok=True)
+            report.make_layer_report(
+                prei_grid, pre_a_alive, pre_b_alive, p,
+                dft_fn, irreps, coset_masks_L, coset_masks_R,
+                report_dir, cluster_tau, colour_rule, artifacts,
+            )
             
 
         # 5) Last-layer cluster → logits using transformer effective map
