@@ -1206,8 +1206,8 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
     # 1) DFT once
     flat_all = pre_grid.reshape(G*G, N)
     F_full   = dft_2d(flat_all)
-    F_L      = dft_2d(left)
-    F_R      = dft_2d(right)
+    # F_L      = dft_2d(left)
+    # F_R      = dft_2d(right)
 
     # 2) cluster
     names = [lab for lab, _, _, _ in irreps]
@@ -1316,7 +1316,7 @@ def prepare_layer_artifacts(pre_grid, #(G, G, N)
 
     artifacts = {
         "F_full": F_full, 
-        "F_L": F_L, "F_R": F_R,
+        #"F_L": F_L, "F_R": F_R,
         "names": names,
         "irrep2neurons": irrep2neurons,
         "freq_cluster": freq_cluster,        # includes both main and drop

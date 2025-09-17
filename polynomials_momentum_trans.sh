@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --constraint='turing|ampere|lovelace'
 
-# polynomials_momentum.sh
+# polynomials_momentum_trans.sh
 # === Load common modules ===
 module reset
 # module load openmpi/4.0.4
@@ -44,4 +44,4 @@ export XLA_FLAGS="--xla_gpu_autotune_level=3"
 cd /home/mila/w/weis/DL/refactored_dihedral
 
 # === Run your training script ===
-python3 -m run.run_training_MLP "$@"
+python3 -m run.run_training_Transformers "$@"

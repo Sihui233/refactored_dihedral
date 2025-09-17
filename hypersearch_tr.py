@@ -16,7 +16,7 @@ WD_LIST = [1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
 # Match your current big P sweep
 P_LIST = [2 ** e for e in range(2, 9)]   # p ∈ {512, 1024, 2048}
 NUM_MLP_LAYERS_LIST = [1]              # transformer MLP layers inside each block
-SEEDS = [1]                    # tweak as you like
+SEEDS = [2]                    # tweak as you like
 
 # -----------------------------
 # global variables
@@ -35,7 +35,7 @@ NN_MULTIPLIER = 8
 # -----------------------------
 # Slurm settings
 # -----------------------------
-SLURM_SCRIPT = "polynomials_momentum.sh"  # sbatch wrapper
+SLURM_SCRIPT = "polynomials_momentum_trans.sh"  # sbatch wrapper
 QUEUE_CAP = 1000
 SLEEP_WHEN_BUSY = 60
 MAX_SUBMIT_ATTEMPTS = 6

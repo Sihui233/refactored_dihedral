@@ -463,7 +463,7 @@ def run_post_training_analysis(*,
         print(f"\n=== Post-training analysis (alive-only, original IDs) for seed {seed} ===")
         gdir = paths.seed_graph_dir(mdir, seed)
         os.makedirs(gdir, exist_ok=True)
-
+        
         # params for this seed
         params_seed = jax.tree_util.tree_map(lambda x: x[seed_idx], states.params)
 
@@ -537,6 +537,12 @@ def run_post_training_analysis(*,
             #     dft_fn, irreps, coset_masks_L, coset_masks_R,
             #     report_dir, cluster_tau, colour_rule, artifacts,
             # )
+            # report.export_cluster_neuron_pages_2x4(prei_grid,left,right,
+            #                      dft_fn, irreps, 
+            #                      report_dir,
+            #                      artifacts,
+            #                      rounding_scale=10
+            #                      )
 
         # for layer_idx in range(num_layers-2):
         #     plot_Wblock_pca_by_srcfreq_color_by_tgtfreq(
@@ -550,36 +556,36 @@ def run_post_training_analysis(*,
         #     )
 
 
-        # ------ cluster → logits (use ORIGINAL ids to slice last layer & W_out) ------
-        preacts, X_in, weights_by_layer, cluster_contribs, cluster_W_blocks = get_all_preacts_and_embeddings(
-            model=model, params=params_seed, group_size=group_size, clusters_by_layer=layers_freq,
-        )
+        # # ------ cluster → logits (use ORIGINAL ids to slice last layer & W_out) ------
+        # preacts, X_in, weights_by_layer, cluster_contribs, cluster_W_blocks = get_all_preacts_and_embeddings(
+        #     model=model, params=params_seed, group_size=group_size, clusters_by_layer=layers_freq,
+        # )
 
-        # write per-cluster JSON (keys are ORIGINAL ids)
-        pdf_root = os.path.join(gdir, "pdf_plots", f"seed_{seed}")
-        os.makedirs(pdf_root, exist_ok=True)
-        json_root = make_some_jsons(
-            preacts=preacts,
-            group_size=group_size,
-            clusters_by_layer=layers_freq,            # ORIGINAL ids
-            cluster_weights_to_logits=cluster_W_blocks,
-            cluster_contribs_to_logits=cluster_contribs,
-            save_dir=pdf_root,
-            sanity_check=True,
-        )
-        print(f"Wrote cluster JSONs to {json_root}")
+        # # write per-cluster JSON (keys are ORIGINAL ids)
+        # pdf_root = os.path.join(gdir, "pdf_plots", f"seed_{seed}")
+        # os.makedirs(pdf_root, exist_ok=True)
+        # json_root = make_some_jsons(
+        #     preacts=preacts,
+        #     group_size=group_size,
+        #     clusters_by_layer=layers_freq,            # ORIGINAL ids
+        #     cluster_weights_to_logits=cluster_W_blocks,
+        #     cluster_contribs_to_logits=cluster_contribs,
+        #     save_dir=pdf_root,
+        #     sanity_check=True,
+        # )
+        # print(f"Wrote cluster JSONs to {json_root}")
 
-        # PDF (optional)
-        num_pc = 4 if "cheating" not in mlp_class_lower else 2
-        for freq, C_freq in cluster_contribs.items():
-            generate_pdf_plots_for_matrix(
-                C_freq, p,
-                save_dir=pdf_root, seed=seed,
-                freq_list=[freq],
-                tag=f"cluster_contributions_to_logits_freq={freq}",
-                tag_q="full",
-                colour_rule=colour_quad_mod_g,
-                class_string=mlp_class_lower,
-                num_principal_components=num_pc,
-            )
-        print(f"PDF plots written → {pdf_root}")
+        # # PDF (optional)
+        # num_pc = 4 if "cheating" not in mlp_class_lower else 2
+        # for freq, C_freq in cluster_contribs.items():
+        #     generate_pdf_plots_for_matrix(
+        #         C_freq, p,
+        #         save_dir=pdf_root, seed=seed,
+        #         freq_list=[freq],
+        #         tag=f"cluster_contributions_to_logits_freq={freq}",
+        #         tag_q="full",
+        #         colour_rule=colour_quad_mod_g,
+        #         class_string=mlp_class_lower,
+        #         num_principal_components=num_pc,
+        #     )
+        # print(f"PDF plots written → {pdf_root}")

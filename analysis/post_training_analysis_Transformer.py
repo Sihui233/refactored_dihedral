@@ -540,56 +540,63 @@ def run_post_training_analysis(
             with open(os.path.join(gdir, f"approx_summary_layer{layer_idx+1}_p{p}.json"), "w") as f:
                 json.dump(approx, f, indent=2)
 
-            # commented out for scaling
-            report_dir = os.path.join(gdir, f"report_layer{layer_idx+1}")
-            os.makedirs(report_dir, exist_ok=True)
-            report.make_layer_report(
-                prei_grid, pre_a_alive, pre_b_alive, p,
-                dft_fn, irreps, coset_masks_L, coset_masks_R,
-                report_dir, cluster_tau, colour_rule, artifacts,
-            )
+        #     # commented out for scaling
+        #     report_dir = os.path.join(gdir, f"report_layer{layer_idx+1}")
+        #     os.makedirs(report_dir, exist_ok=True)
+        #     report.make_layer_report(
+        #         prei_grid, pre_a_alive, pre_b_alive, p,
+        #         dft_fn, irreps, coset_masks_L, coset_masks_R,
+        #         report_dir, cluster_tau, colour_rule, artifacts,
+        #     )
+
+            # report.export_cluster_neuron_pages_2x4(prei_grid,left,right,
+            #                         dft_fn, irreps, 
+            #                         report_dir,
+            #                         artifacts,
+            #                         rounding_scale=10
+            #                         )
             
 
-        # 5) Last-layer cluster → logits using transformer effective map
-        last_layer_clusters = layers_freq[-1]
-        contribs_dmodel, contribs_logits, Wblocks_logits, Wblocks_dmodel = cluster_contribs_last_layer_transformer(
-            preacts_last=pre_acts_all[-1],
-            params=params_seed,
-            clusters_last_layer=last_layer_clusters,
-        )
+        # # 5) Last-layer cluster → logits using transformer effective map
+        # last_layer_clusters = layers_freq[-1]
+        # contribs_dmodel, contribs_logits, Wblocks_logits, Wblocks_dmodel = cluster_contribs_last_layer_transformer(
+        #     preacts_last=pre_acts_all[-1],
+        #     params=params_seed,
+        #     clusters_last_layer=last_layer_clusters,
+        # )
 
-        # 6) (optional) write per-cluster JSON compatible with MLP make_some_jsons
-        if write_json:
-            json_root = os.path.join(gdir, "json")
-            os.makedirs(json_root, exist_ok=True)
-            _ = make_some_jsons(
-                preacts=pre_acts_all,
-                group_size=group_size,
-                clusters_by_layer=layers_freq,
-                cluster_weights_to_logits=Wblocks_logits,
-                cluster_weights_to_dmodel=Wblocks_dmodel,  
-                cluster_contribs_to_logits=contribs_logits,
-                cluster_contribs_to_dmodel=contribs_dmodel,
-                save_dir=gdir,
-                subdir="json",
-                sanity_check=True,
-            )
-            print(f"[Transformer] cluster JSONs written → {os.path.join(gdir, 'json')}")
+        # # 6) (optional) write per-cluster JSON compatible with MLP make_some_jsons
+        # if write_json:
+        #     json_root = os.path.join(gdir, "json")
+        #     os.makedirs(json_root, exist_ok=True)
+        #     _ = make_some_jsons(
+        #         preacts=pre_acts_all,
+        #         group_size=group_size,
+        #         clusters_by_layer=layers_freq,
+        #         cluster_weights_to_logits=Wblocks_logits,
+        #         cluster_weights_to_dmodel=Wblocks_dmodel,  
+        #         cluster_contribs_to_logits=contribs_logits,
+        #         cluster_contribs_to_dmodel=contribs_dmodel,
+        #         save_dir=gdir,
+        #         subdir="json",
+        #         sanity_check=True,
+        #     )
+        #     print(f"[Transformer] cluster JSONs written → {os.path.join(gdir, 'json')}")
 
-        # 7) (optional) PDFs of cluster→logits like MLP
-        if write_pdfs and contribs_logits:  # CHANGED: was `contribs_to_logits`
-            pdf_root = os.path.join(gdir, "pdf_plots", f"seed_{seed}")
-            os.makedirs(pdf_root, exist_ok=True)
-            num_pc = 4  # tune if desired
-            for freq, C_freq in contribs_logits.items():
-                generate_pdf_plots_for_matrix(
-                    C_freq, p,
-                    save_dir=pdf_root, seed=seed,
-                    freq_list=[freq],
-                    tag=f"cluster_contributions_to_logits_freq={freq}",
-                    tag_q="full",
-                    colour_rule=colour_quad_mod_g,
-                    class_string=class_lower,
-                    num_principal_components=num_pc,
-                )
-            print(f"[Transformer] PDF plots written → {pdf_root}")
+        # # 7) (optional) PDFs of cluster→logits like MLP
+        # if write_pdfs and contribs_logits:  # CHANGED: was `contribs_to_logits`
+        #     pdf_root = os.path.join(gdir, "pdf_plots", f"seed_{seed}")
+        #     os.makedirs(pdf_root, exist_ok=True)
+        #     num_pc = 4  # tune if desired
+        #     for freq, C_freq in contribs_logits.items():
+        #         generate_pdf_plots_for_matrix(
+        #             C_freq, p,
+        #             save_dir=pdf_root, seed=seed,
+        #             freq_list=[freq],
+        #             tag=f"cluster_contributions_to_logits_freq={freq}",
+        #             tag_q="full",
+        #             colour_rule=colour_quad_mod_g,
+        #             class_string=class_lower,
+        #             num_principal_components=num_pc,
+        #         )
+        #     print(f"[Transformer] PDF plots written → {pdf_root}")
