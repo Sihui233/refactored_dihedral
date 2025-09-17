@@ -13,8 +13,8 @@ from controllers.config_Transformer import Config
 from controllers.paths_Transformer import base_dir, model_dir, seed_graph_dir
 import controllers.training_prep_Transformer as prep
 import analysis.while_training_analysis_gen as wta
-import analysis.post_training_analysis_Transformer as pta   # ADDED
-from color_rules import colour_quad_a_only                   # ADDED
+import analysis.post_training_analysis_Transformer as pta
+from color_rules import colour_quad_a_only
 
 
 def main(argv):
