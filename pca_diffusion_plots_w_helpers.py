@@ -825,25 +825,19 @@ def _write_multiplot_3d(coords: np.ndarray,
                         mult: bool
                         ):
     """
-    Four-panel 3-D scatter  ➜  PDF  (+HTML interactive)
+    Four-panel 3-D scatter → PDF (+HTML interactive)
 
-    Parameters
-    ----------
-    coords : (n_points, n_dims) array
-        Point coordinates.
-    colour : (n_points,) array
-        Per-point colour values.
-    ctitle : str
-        Title for the colour-bar.
-    out_path : str
-        Destination PDF (multi-page).
-    p : int
-        Modulus for colour bar scaling.
-    seed, label, tag
-        Passed straight through to titles / figure text.
-    f : int
-        Frequency
+    Uses step-size linking for multi-view overlays:
+      d := (f/g)^{-1} mod (p/g),  g = gcd(f,p)
+    A-lines/B-lines/C-lines are ordered along their local residue
+    by +d modulo g (loop closed if ≥3 points).
     """
+    # --- imports that live here to avoid changing module-level imports ---
+    from color_rules import (
+        colour_quad_a_only, colour_quad_b_only, colour_quad_mod_g,
+        step_size, lines_a_mod_g_step, lines_b_mod_g_step, lines_c_mod_g_step
+    )
+
     g       = p // math.gcd(p, f) or p
     n_pts   = coords.shape[0]
     side    = int(math.isqrt(n_pts))
@@ -858,20 +852,16 @@ def _write_multiplot_3d(coords: np.ndarray,
         horizontal_spacing=0.03, vertical_spacing=0.03
     )
 
-    # ─── 共有数据预处理 ──────────────────────────────────────────────
+    # ─── shared data ───────────────────────────────────────────────────────────
     idxs    = np.arange(n_pts)
     a_vals  = idxs // side
     b_vals  = idxs %  side
     hover_kw = _make_hover(a_vals, b_vals)
 
-    # 如果不是多视图：直接画一次散点（用函数输入的 colour / colorscale）
+    # ─── simple (no multi-view) ───────────────────────────────────────────────
     if not multi_view:
         for s_idx, (i, j, k) in enumerate(triplets, 1):
             row, col = (1, s_idx) if s_idx <= 2 else (2, s_idx-2)
-            step      = max(1, p_cbar // 10)
-            ticks     = list(range(0, p_cbar, step))
-            if ticks[-1] != p_cbar-1:
-                ticks.append(p_cbar-1)
 
             x = _jitter_if_constant(coords[:, i])
             y = _jitter_if_constant(coords[:, j])
@@ -879,17 +869,18 @@ def _write_multiplot_3d(coords: np.ndarray,
                 go.Scatter3d(
                     x=x, y=y, z=coords[:, k],
                     mode="markers",
-                    marker=dict(size=3,
-                                color=colour,
-                                colorscale=colorscale,
-                                cmin=0, cmax=p_cbar-1,
-                                showscale=(s_idx == 1),
-                                colorbar=dict(
-                                    title=dict(text=ctitle, side="right", font=dict(size=CBAR_TITLE_SIZE)),
-                                    tickfont=dict(size=CBAR_TICK_SIZE),
-                                    len=0.90,
-                                ),
-                            ),
+                    marker=dict(
+                        size=3,
+                        color=colour,
+                        colorscale=colorscale,
+                        cmin=0, cmax=p_cbar-1,
+                        showscale=(s_idx == 1),
+                        colorbar=dict(
+                            title=dict(text=ctitle, side="right", font=dict(size=CBAR_TITLE_SIZE)),
+                            tickfont=dict(size=CBAR_TICK_SIZE),
+                            len=0.90,
+                        ),
+                    ),
                     **hover_kw
                 ),
                 row=row, col=col
@@ -899,195 +890,132 @@ def _write_multiplot_3d(coords: np.ndarray,
             fig.layout[sid].yaxis.title.text = f"{label}{j}"
             fig.layout[sid].zaxis.title.text = f"{label}{k}"
 
-    # ─── Multi ─────────────────────────────────────────
+    # ─── multi-view with step-size linking ────────────────────────────────────
     else:
+        # point colors (same as before)
+        col_a, _, _, cs_a         = colour_quad_a_only(a_vals, b_vals, p, f, "full")
+        col_b, _, _, cs_b         = colour_quad_b_only(a_vals, b_vals, p, f, "full")
+        col_c, _, pcbar_c, cs_c   = colour_quad_mod_g(a_vals, b_vals, p, f, "full")
+        col_a = np.asarray(col_a); col_b = np.asarray(col_b); col_c = np.asarray(col_c)
 
-        # color vec
-        col_a, _, _, cs_a = colour_quad_a_only(a_vals, b_vals, p, f, "full")
-        col_b, _, _, cs_b = colour_quad_b_only(a_vals, b_vals, p, f, "full")
-        col_c, _, pcbar_c, cs_c = colour_quad_mod_g(a_vals, b_vals, p, f, "full")
-
-        # line idx
-        h_pairs = lines_a_mod_g(a_vals, b_vals,p,g)
-        # for b_fix in list(range(g)) + [p + i for i in range(g)]:
-        #     # --- split according to a_vals ---
-        #     solid_idx = np.where((a_vals < g) & (b_vals == b_fix))[0]
-        #     dash_idx  = np.where((a_vals >= p) & (a_vals < p + g) & (b_vals == b_fix))[0]
-
-        #     # --- color ---
-        #     # b_fix < p blue，else red
-        #     color = "blue" if b_fix < p else "red"
-        #     line_id = f"b_{b_fix}" 
-            
-        #     if solid_idx.size > 1:
-        #         h_pairs.append((solid_idx, "solid", color, line_id))
-        #     if dash_idx.size  > 1:
-        #         h_pairs.append((dash_idx,  "dash",  color, line_id))
-
-        v_pairs = lines_b_mod_g(a_vals, b_vals,p,g)
-        # for a_fix in list(range(g)) + [p + i for i in range(g)]:
-        #     # --- split according to b_vals ---
-        #     solid_idx = np.where((b_vals < g) & (a_vals == a_fix))[0]
-        #     dash_idx  = np.where((b_vals >= p) & (b_vals < p + g) & (a_vals == a_fix))[0]
-
-        #     # --- color ---
-        #     # a_fix < p blue，else
-        #     color = "blue" if a_fix < p else "red"
-        #     line_id = f"a_{a_fix}" 
-            
-        #     if solid_idx.size > 1:
-        #         v_pairs.append((solid_idx, "solid", color, line_id))
-        #     if dash_idx.size  > 1:
-        #         v_pairs.append((dash_idx,  "dash",  color, line_id))
-        c_pairs = lines_c_mod_g(a_vals, b_vals,p,g)
+        # NEW: step size and step-ordered line groups
+        d = step_size(f, p)                              # (f/g)^(-1) mod (p/g)
+        h_pairs = lines_a_mod_g_step(a_vals, b_vals, p, g, d)   # A-lines
+        v_pairs = lines_b_mod_g_step(a_vals, b_vals, p, g, d)   # B-lines
+        c_pairs = lines_c_mod_g_step(a_vals, b_vals, p, g, d)   # C-lines
 
         n_h, n_v, n_c = len(h_pairs), len(v_pairs), len(c_pairs)
+        legend_shown_a, legend_shown_b, legend_shown_c = set(), set(), set()
 
-        legend_shown_a, legend_shown_b,legend_shown_c = set(), set(), set()
         for s_idx, (i, j, k) in enumerate(triplets, 1):
             row, col = (1, s_idx) if s_idx <= 2 else (2, s_idx-2)
 
             x = _jitter_if_constant(coords[:, i])
             y = _jitter_if_constant(coords[:, j])
-            # — a-view scatter (visible in default)
+
+            # a-scatter (default visible)
             fig.add_trace(
                 go.Scatter3d(
                     x=x, y=y, z=coords[:, k],
                     mode="markers",
-                    marker=dict(size=3,
-                                color=col_a, colorscale=cs_a,
-                                cmin=0, cmax=2*g-1,
-                                showscale=(s_idx == 1),
-                                colorbar=dict(
-                                    title=dict(text=ctitle, side="right", font=dict(size=CBAR_TITLE_SIZE)),
-                                    tickfont=dict(size=CBAR_TICK_SIZE),
-                                    len=0.90,
-                                ),
-                            ),
-                    name="a mod g",
-                    legendgroup="a",
-                    visible=True,
-                    **hover_kw
+                    marker=dict(
+                        size=3, color=col_a, colorscale=cs_a,
+                        cmin=0, cmax=2*g-1,
+                        showscale=(s_idx == 1),
+                        colorbar=dict(
+                            title=dict(text=ctitle, side="right", font=dict(size=CBAR_TITLE_SIZE)),
+                            tickfont=dict(size=CBAR_TICK_SIZE),
+                            len=0.90,
+                        ),
+                    ),
+                    name="a mod g", legendgroup="a", visible=True, **hover_kw
                 ), row=row, col=col
             )
 
-            # — b-view scatter (hidden)
+            # b-scatter (hidden)
             fig.add_trace(
                 go.Scatter3d(
                     x=x, y=y, z=coords[:, k],
                     mode="markers",
-                    marker=dict(size=3,
-                                color=col_b, colorscale=cs_b,
-                                cmin=0, cmax=2*g-1,
-                                showscale=(s_idx == 1),
-                                colorbar=dict(
-                                    title=dict(text=ctitle, side="right", font=dict(size=CBAR_TITLE_SIZE)),
-                                    tickfont=dict(size=CBAR_TICK_SIZE),
-                                    len=0.90,
-                                ),
-                            ),
-                    name="b mod g",
-                    legendgroup="b",
-                    visible=False,
-                    **hover_kw
+                    marker=dict(
+                        size=3, color=col_b, colorscale=cs_b,
+                        cmin=0, cmax=2*g-1,
+                        showscale=(s_idx == 1),
+                        colorbar=dict(
+                            title=dict(text=ctitle, side="right", font=dict(size=CBAR_TITLE_SIZE)),
+                            tickfont=dict(size=CBAR_TICK_SIZE),
+                            len=0.90,
+                        ),
+                    ),
+                    name="b mod g", legendgroup="b", visible=False, **hover_kw
                 ), row=row, col=col
             )
-            # — c-view scatter (hidden)
+
+            # c-scatter (hidden)
             fig.add_trace(
                 go.Scatter3d(
                     x=x, y=y, z=coords[:, k],
                     mode="markers",
-                    marker=dict(size=3,
-                                color=col_c, colorscale=cs_c,
-                                cmin=0, cmax=pcbar_c-1,
-                                showscale=(s_idx == 1),
-                                colorbar=dict(
-                                    title=dict(text=ctitle, side="right", font=dict(size=CBAR_TITLE_SIZE)),
-                                    tickfont=dict(size=CBAR_TICK_SIZE),
-                                    len=0.90,
-                                ),
-                            ),
-                    name="c mod g",
-                    legendgroup="c",
-                    showlegend=(s_idx == 1),
-                    visible=False,
-                    **hover_kw
+                    marker=dict(
+                        size=3, color=col_c, colorscale=cs_c,
+                        cmin=0, cmax=pcbar_c-1,
+                        showscale=(s_idx == 1),
+                        colorbar=dict(
+                            title=dict(text=ctitle, side="right", font=dict(size=CBAR_TITLE_SIZE)),
+                            tickfont=dict(size=CBAR_TICK_SIZE),
+                            len=0.90,
+                        ),
+                    ),
+                    name="c mod g", legendgroup="c",
+                    showlegend=(s_idx == 1), visible=False, **hover_kw
                 ), row=row, col=col
             )
 
-            # — (lines for graph a)
-            for idx_arr, dash, color, gid in h_pairs:
-                idx_sorted = idx_arr[np.argsort(a_vals[idx_arr])]
-
-                if idx_sorted.size > 2:                 # at least 3 points to form a closed loop
-                    idx_plot = np.concatenate([idx_sorted, idx_sorted[:1]])
-                else:                                   # only 2 points
-                    idx_plot = idx_sorted
-
+            # A-lines (step-ordered already)
+            for idx_ordered, dash, color, gid in h_pairs:
+                idx_plot = idx_ordered
+                if idx_plot.size > 2:
+                    idx_plot = np.concatenate([idx_plot, idx_plot[:1]])  # close loop
                 show_legend = gid not in legend_shown_a
                 legend_shown_a.add(gid)
                 fig.add_trace(
                     go.Scatter3d(
                         x=coords[idx_plot, i], y=coords[idx_plot, j], z=coords[idx_plot, k],
-                        mode="lines",
-                        name = gid,                  
-                        legendgroup = gid,           # same group, visible/hidden the same time
-                        showlegend = show_legend,
+                        mode="lines", name=gid, legendgroup=gid, showlegend=show_legend,
                         line=dict(color=color, dash=dash, width=1.2),
-                        hoverinfo="skip",
-                        visible=True
+                        hoverinfo="skip", visible=True
                     ), row=row, col=col
                 )
 
-            # — (lines for graph b)
-            for idx_arr, dash, color, gid in v_pairs:
-                idx_sorted = idx_arr[np.argsort(b_vals[idx_arr])]
-
-                if idx_sorted.size > 2:
-                    idx_plot = np.concatenate([idx_sorted, idx_sorted[:1]])
-                else:                                   
-                    idx_plot = idx_sorted
-
+            # B-lines (step-ordered already)
+            for idx_ordered, dash, color, gid in v_pairs:
+                idx_plot = idx_ordered
+                if idx_plot.size > 2:
+                    idx_plot = np.concatenate([idx_plot, idx_plot[:1]])
                 show_legend = gid not in legend_shown_b
                 legend_shown_b.add(gid)
                 fig.add_trace(
                     go.Scatter3d(
                         x=coords[idx_plot, i], y=coords[idx_plot, j], z=coords[idx_plot, k],
-                        mode="lines",
-                        name = gid, 
-                        legendgroup = gid, 
-                        showlegend = show_legend,
+                        mode="lines", name=gid, legendgroup=gid, showlegend=show_legend,
                         line=dict(color=color, dash=dash, width=1.2),
-                        hoverinfo="skip",
-                        visible=False
+                        hoverinfo="skip", visible=False
                     ), row=row, col=col
                 )
 
-            # — (lines for graph c)
-            for idx_arr, dash, color, gid in c_pairs:
-                a_sub = a_vals[idx_arr]
-                b_sub = b_vals[idx_arr]
-                # lexsort 的第一个参数是次要关键字，第二个是主要关键字
-                order = np.lexsort((b_sub, a_sub))
-                idx_sorted = idx_arr[order]
-
-                if idx_sorted.size > 2:
-                    idx_plot = np.concatenate([idx_sorted, idx_sorted[:1]])
-                else:                                   
-                    idx_plot = idx_sorted
-
+            # C-lines (step-ordered already)
+            for idx_ordered, dash, color, gid in c_pairs:
+                idx_plot = idx_ordered
+                if idx_plot.size > 2:
+                    idx_plot = np.concatenate([idx_plot, idx_plot[:1]])
                 show_legend = gid not in legend_shown_c
                 legend_shown_c.add(gid)
                 fig.add_trace(
                     go.Scatter3d(
                         x=coords[idx_plot, i], y=coords[idx_plot, j], z=coords[idx_plot, k],
-                        mode="lines",
-                        name = gid, 
-                        legendgroup = gid, 
-                        showlegend = show_legend,
+                        mode="lines", name=gid, legendgroup=gid, showlegend=show_legend,
                         line=dict(color=color, dash=dash, width=1.2),
-                        hoverinfo="skip",
-                        visible=False
+                        hoverinfo="skip", visible=False
                     ), row=row, col=col
                 )
 
@@ -1096,42 +1024,29 @@ def _write_multiplot_3d(coords: np.ndarray,
             fig.layout[sid].yaxis.title.text = f"{label}{j}"
             fig.layout[sid].zaxis.title.text = f"{label}{k}"
 
-        # —— 按钮可见性向量
-        vis_a = []
-        vis_b = []
-        vis_c = []
+        # visibility toggles (trace order: a-scatter, b-scatter, c-scatter, A-lines..., B-lines..., C-lines...)
+        vis_a, vis_b, vis_c = [], [], []
         for _ in range(len(triplets)):
-            # 每个 subplot: [a-scatter, c-scatter, b-scatter, h-lines..., v-lines...]
-            vis_a += [True,  False, False] + [True]*n_h + [False]*n_v + [False]*n_c
-            vis_b += [False, True,  False] + [False]*n_h + [True]*n_v + [False]*n_c
+            vis_a += [True,  False, False] + [True]*n_h  + [False]*n_v + [False]*n_c
+            vis_b += [False, True,  False] + [False]*n_h + [True]*n_v  + [False]*n_c
             vis_c += [False, False, True ] + [False]*n_h + [False]*n_v + [True]*n_c
- 
-        fig.update_layout(
-             updatemenus=[dict(
-                buttons=[
-                    dict(label="a mod g",
-                         method="update",
-                         args=[{"visible": vis_a},
-                               {"title": "colour = a mod g"}]),
-                    dict(label="b mod g",
-                         method="update",
-                         args=[{"visible": vis_b},
-                               {"title": "colour = b mod g"}]),
-                    dict(label="c mod g",
-                         method="update",
-                         args=[{"visible": vis_c},
-                               {"title": "colour = c mod g"}]),
-                ],
-                 direction="down",
-                 x=0.99, y=1.05, xanchor="left",
-                 pad={"t": 0, "r": 6}
-             )]
-         )
-        
-        fig.update_layout(legend=LEGEND_POS)
-        
 
-    # 统一 3D 轴标题与刻度字号（所有子场景）
+        fig.update_layout(
+            updatemenus=[dict(
+                buttons=[
+                    dict(label="a mod g", method="update",
+                         args=[{"visible": vis_a}, {"title": "colour = a mod g"}]),
+                    dict(label="b mod g", method="update",
+                         args=[{"visible": vis_b}, {"title": "colour = b mod g"}]),
+                    dict(label="c mod g", method="update",
+                         args=[{"visible": vis_c}, {"title": "colour = c mod g"}]),
+                ],
+                direction="down", x=0.99, y=1.05, xanchor="left", pad={"t": 0, "r": 6}
+            )]
+        )
+        fig.update_layout(legend=LEGEND_POS)
+
+    # ─── axes font sizes ───────────────────────────────────────────────────────
     for layout_key in fig.layout:
         if str(layout_key).startswith("scene"):
             scene = fig.layout[layout_key]
@@ -1142,18 +1057,17 @@ def _write_multiplot_3d(coords: np.ndarray,
             scene.yaxis.tickfont = dict(size=TICK_SIZE)
             scene.zaxis.tickfont = dict(size=TICK_SIZE)
 
-    # ─── general Layout & output ───────────────────────────────────────────
+    # ─── layout & output ──────────────────────────────────────────────────────
     fig.update_layout(
-        width=1600, height=1200,     # 原来 1000×900 -> 放大
+        width=1600, height=1200,
         title=f"{label} 3-D (first 4) - seed {seed} - {tag}",
         margin=dict(l=40, r=40, t=80, b=40),
         font=dict(size=FONT_SIZE),
     )
-    p = Path(out_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_image(out_path, format="pdf")                 # static PDF
-    fig.write_html(os.path.splitext(out_path)[0] + ".html",
-                   include_plotlyjs="cdn")                  # interactive HTML
+    p_out = Path(out_path)
+    p_out.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(out_path, format="pdf")
+    fig.write_html(os.path.splitext(out_path)[0] + ".html", include_plotlyjs="cdn")
     print(f"[{label} 3-D] → {out_path}")
 
 

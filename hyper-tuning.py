@@ -18,13 +18,13 @@ WD_LIST = [1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
 # NUM_LAYERS_LIST = [1]
 # SEEDS = list(range(1))
 
-# P_LIST = [2 ** e for e in range(2, 9)]
-# NUM_LAYERS_LIST = [2]
-# SEEDS = list(range(1))  
+P_LIST = [2 ** 10]
+NUM_LAYERS_LIST = [1]
+SEEDS = [0] 
 
-P_LIST = [2 ** e for e in range(9, 12)] # change time to 72:00:00 and neurons to 10000
-NUM_LAYERS_LIST = [1,2]
-SEEDS = list(range(1))
+# P_LIST = [2 ** e for e in range(9, 12)] # change time to 72:00:00 and neurons to 10000
+# NUM_LAYERS_LIST = [1,2]
+# SEEDS = list(range(1))
 
 # # test
 # LR_LIST = [1e-5]

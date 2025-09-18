@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=47Gb
-#SBATCH --time=23:35:00
+#SBATCH --time=47:35:00
 #SBATCH --gres=gpu:1
 #SBATCH --constraint='turing|ampere|lovelace'
 
