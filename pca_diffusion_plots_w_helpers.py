@@ -12,7 +12,10 @@ import math, tempfile, uuid
 from typing import List
 from color_rules import colour_quad_mul_f        # ①  f·(a±b) mod p
 from color_rules import colour_quad_mod_g, colour_quad_mod_g_no_fb      # ②  (a±b) mod g
-from color_rules import colour_quad_a_only, colour_quad_b_only,lines_a_mod_g,lines_b_mod_g, lines_c_mod_g
+from color_rules import (
+        colour_quad_a_only, colour_quad_b_only,
+        step_size, lines_a_mod_g_step, lines_b_mod_g_step, lines_c_mod_g_step
+    )
 # from mlp_models_multilayer import DonutMLP
 from persistent_homology_gpu import run_ph_for_point_cloud
 from pathlib import Path
@@ -832,11 +835,6 @@ def _write_multiplot_3d(coords: np.ndarray,
     A-lines/B-lines/C-lines are ordered along their local residue
     by +d modulo g (loop closed if ≥3 points).
     """
-    # --- imports that live here to avoid changing module-level imports ---
-    from color_rules import (
-        colour_quad_a_only, colour_quad_b_only, colour_quad_mod_g,
-        step_size, lines_a_mod_g_step, lines_b_mod_g_step, lines_c_mod_g_step
-    )
 
     g       = p // math.gcd(p, f) or p
     n_pts   = coords.shape[0]
@@ -2157,7 +2155,7 @@ def _make_multiplot_3d_figure_html_only(
     tag_q: str,
 ) -> go.Figure:
     """
-    复用 _write_multiplot_3d 的结构，但只构建 Figure（不写 PDF），方便 HTML 重建。
+    reuse _write_multiplot_3d's structure, but only build Figure (no PDF generated) to facilitate HTML rebuild.
     """
     n_pts = coords.shape[0]
     side = int(math.isqrt(n_pts)) if n_pts > 0 else 0
@@ -2180,7 +2178,6 @@ def _make_multiplot_3d_figure_html_only(
     hover_kw = _make_hover(a_vals, b_vals)
 
     if not multi_view:
-        # 单视图：直接画颜色 = colour
         for s_idx, (i, j, k) in enumerate(triplets, 1):
             row, col = (1, s_idx) if s_idx <= 2 else (2, s_idx - 2)
             step = max(1, p_cbar // 10)
@@ -2219,19 +2216,17 @@ def _make_multiplot_3d_figure_html_only(
             fig.layout[sid].yaxis.title.text = f"{label}{j}"
             fig.layout[sid].zaxis.title.text = f"{label}{k}"
     else:
-        # 多视图：与 _write_multiplot_3d 的按钮逻辑一致（a/b/c 三套）
+        
         A = a_vals
         B = b_vals
         col_a, _, _, cs_a = colour_quad_a_only(A, B, p, f, "full")
         col_b, _, _, cs_b = colour_quad_b_only(A, B, p, f, "full")
-        # col_c, _, pcbar_c, cs_c = colour_quad_mod_g(A, B, p, f, "full")
         col_c, _, pcbar_c, cs_c = colour_quad_mod_g_no_fb(A, B, p, f, "full")
 
-
-        h_pairs = lines_a_mod_g(A, B, p, g)
-        v_pairs = lines_b_mod_g(A, B, p, g)
-        #c_pairs = lines_c_mod_g(A, B, p, g)
-        c_pairs = lines_a_mod_g(A, B, p, g)
+        d = step_size(f, p)              # d = (f/g)^(-1) mod (p/g)
+        h_pairs = lines_a_mod_g_step(A, B, p, g, d)
+        v_pairs = lines_b_mod_g_step(A, B, p, g, d)
+        c_pairs = lines_c_mod_g_step(A, B, p, g, d)
 
         n_h, n_v, n_c = len(h_pairs), len(v_pairs), len(c_pairs)
 
@@ -2329,8 +2324,7 @@ def _make_multiplot_3d_figure_html_only(
 
             # a-lines
             for idx_arr, dash, color, gid in h_pairs:
-                idx_sorted = idx_arr[np.argsort(A[idx_arr])]
-                idx_plot = np.concatenate([idx_sorted, idx_sorted[:1]]) if idx_sorted.size > 2 else idx_sorted
+                idx_plot = np.concatenate([idx_arr, idx_arr[:1]]) if idx_arr.size > 2 else idx_arr
                 show_legend = gid not in legend_shown_a
                 legend_shown_a.add(gid)
                 fig.add_trace(
@@ -2352,8 +2346,7 @@ def _make_multiplot_3d_figure_html_only(
 
             # b-lines
             for idx_arr, dash, color, gid in v_pairs:
-                idx_sorted = idx_arr[np.argsort(B[idx_arr])]
-                idx_plot = np.concatenate([idx_sorted, idx_sorted[:1]]) if idx_sorted.size > 2 else idx_sorted
+                idx_plot = np.concatenate([idx_arr, idx_arr[:1]]) if idx_arr.size > 2 else idx_arr
                 show_legend = gid not in legend_shown_b
                 legend_shown_b.add(gid)
                 fig.add_trace(
@@ -2375,11 +2368,7 @@ def _make_multiplot_3d_figure_html_only(
 
             # c-lines
             for idx_arr, dash, color, gid in c_pairs:
-                a_sub = A[idx_arr]
-                b_sub = B[idx_arr]
-                order = np.lexsort((b_sub, a_sub))
-                idx_sorted = idx_arr[order]
-                idx_plot = np.concatenate([idx_sorted, idx_sorted[:1]]) if idx_sorted.size > 2 else idx_sorted
+                idx_plot = np.concatenate([idx_arr, idx_arr[:1]]) if idx_arr.size > 2 else idx_arr
                 show_legend = gid not in legend_shown_c
                 legend_shown_c.add(gid)
                 fig.add_trace(
@@ -2404,22 +2393,21 @@ def _make_multiplot_3d_figure_html_only(
             fig.layout[sid].yaxis.title.text = f"{label}{j}"
             fig.layout[sid].zaxis.title.text = f"{label}{k}"
 
-        # 三个视图的可见性切换按钮
         vis_a, vis_b, vis_c = [], [], []
         for _ in range(len(triplets)):
-            vis_a += [True, False, False] + [True] * n_h + [False] * n_v + [False] * n_c
-            vis_b += [False, True, False] + [False] * n_h + [True] * n_v + [False] * n_c
-            vis_c += [False, False, True] + [False] * n_h + [False] * n_v + [True] * n_c
+            vis_a += [True,  False, False] + [True]  * n_h + [False] * n_v + [False] * n_c
+            vis_b += [False, True,  False] + [False] * n_h + [True]  * n_v + [False] * n_c
+            vis_c += [False, False, True ] + [False] * n_h + [False] * n_v + [True]  * n_c
 
         fig.update_layout(
             updatemenus=[dict(
                 buttons=[
                     dict(label="a mod g", method="update",
-                         args=[{"visible": vis_a}, {"title": {"text": "colour = a mod g"}}]),
+                         args=[{"visible": vis_a}, {"title": {"text": "colour = a mod g (step-linked)"}}]),
                     dict(label="b mod g", method="update",
-                         args=[{"visible": vis_b}, {"title": {"text": "colour = b mod g"}}]),
+                         args=[{"visible": vis_b}, {"title": {"text": "colour = b mod g (step-linked)"}}]),
                     dict(label="c mod g", method="update",
-                         args=[{"visible": vis_c}, {"title": {"text": "colour = c mod g"}}]),
+                         args=[{"visible": vis_c}, {"title": {"text": "colour = c mod g (step-linked)"}}]),
                 ],
                 direction="down",
                 x=0.99, y=1.05, xanchor="left",
@@ -2428,13 +2416,12 @@ def _make_multiplot_3d_figure_html_only(
         )
         fig.update_layout(legend=LEGEND_POS)
 
-    # 统一 3D 轴/字号
     for layout_key in fig.layout:
         if str(layout_key).startswith("scene"):
             scene = fig.layout[layout_key]
             scene.xaxis.title.font = dict(size=FONT_SIZE)
-            scene.yaxis.title.font = dict(size=FONT_SIZE)
-            scene.zaxis.title.font = dict(size=FONT_SIZE)
+            scene.yaxis.title.font = dict(size=TICK_SIZE)
+            scene.zaxis.title.font = dict(size=TICK_SIZE)
             scene.xaxis.tickfont = dict(size=TICK_SIZE)
             scene.yaxis.tickfont = dict(size=TICK_SIZE)
             scene.zaxis.tickfont = dict(size=TICK_SIZE)
@@ -2448,6 +2435,7 @@ def _make_multiplot_3d_figure_html_only(
         showlegend=True,
     )
     return fig
+
 
 
 def rebuild_embedding_html_from_bundle(

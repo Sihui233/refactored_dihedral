@@ -18,7 +18,7 @@ WD_LIST = [1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
 # NUM_LAYERS_LIST = [1]
 # SEEDS = list(range(1))
 
-P_LIST = [2 ** 10]
+P_LIST = [2 ** 9]
 NUM_LAYERS_LIST = [1]
 SEEDS = [0] 
 

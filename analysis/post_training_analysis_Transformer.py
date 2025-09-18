@@ -300,102 +300,142 @@ def compute_first_layer_ab_contribs_transformer(
     *,
     model,            # TransformerOneEmbed or TransformerTwoEmbed
     params: dict,
-    group_size: int,           # group size
+    group_size: int,             # group size (|G|) used to enumerate the full grid
     last_token_index: int = 1,   # we read logits from the last token
     bias_mode: str = "b",        # "b" (default), "even", or "none"
+    # NEW: optional streaming controls
+    target_chunk_mb: int = 256,  # aim for ~this much device memory per batch
+    use_bfloat16: bool = True,   # lower precision for attn/v to save memory
 ):
     """
-    Returns:
-      pre_L1_from_a : (group_size:^2, d_mlp)  -- contribution from token 'a' via attention
-      pre_L1_from_b : (group_size:^2, d_mlp)  -- residual (Eb+pos1) + attention from 'b' (+ bias per bias_mode)
-      pre_L1_total  : (group_size:^2, d_mlp)  -- sum of the two (for sanity)
-      pre_L1_hook   : (p^2, d_mlp)  -- actual hook_pre1 (for sanity)
+    Returns (as NumPy on CPU):
+      pre_L1_from_a : (group_size^2, d_mlp)
+      pre_L1_from_b : (group_size^2, d_mlp)
+      pre_L1_total  : (group_size^2, d_mlp)
+      pre_L1_hook   : (group_size^2, d_mlp)
+    Computation is streamed in chunks to avoid GPU OOM.
     """
+    import numpy as _np
+    import jax
+    import jax.numpy as jnp
 
-    # 1) Build full grid inputs (a,b)
-    a = np.arange(group_size, dtype=np.int32); b = np.arange(group_size, dtype=np.int32)
-    A, B = np.meshgrid(a, b, indexing="ij")
-    x_full = jnp.stack([A.ravel(), B.ravel()], axis=-1).astype(jnp.int32)  # (p^2, 2)
-    Bsize = x_full.shape[0]
+    Bsize = int(group_size) * int(group_size)
 
-    # 2) One forward pass with intermediates
-    _, inter = model.apply({"params": params}, x_full, training=False, mutable=["intermediates"])
-    ints = inter["intermediates"]
+    # Precompute embedding pieces on host for cheap indexing
+    Wa, Wb = model.extract_embeddings_ab(params)           # (p, D), (p, D)
+    pos0, pos1 = _np.asarray(params["pos_embed"]["W_pos"][:2])  # (D,), (D,)
+    Wb = _np.asarray(Wb)
 
-    # Attention pieces from block 0
-    attn = _find_by_suffix(ints, "blocks_0/attn/hook_attn")  # (B, H, Q, P)
-    v    = _find_by_suffix(ints, "blocks_0/attn/hook_v")     # (B, H, P, d_head)
-    if attn is None:
-        attn = _find_by_suffix(ints, "hook_attn")
-    if v is None:
-        v = _find_by_suffix(ints, "hook_v")
-    if attn is None or v is None:
-        raise KeyError("Could not find attention hooks (hook_attn, hook_v) in intermediates.")
+    # Pull weights once (on device)
+    W_O = jnp.asarray(params["blocks_0"]["attn"]["W_O"])     # (d_model, H*d_head)
+    W0  = jnp.asarray(params["blocks_0"]["mlp"]["W_0"])      # (d_mlp, d_model)
+    b0  = jnp.asarray(params["blocks_0"]["mlp"]["b_0"])      # (d_mlp,)
+    d_mlp = int(W0.shape[0])
 
-    attn = jnp.asarray(attn)     # (B, H, 2, 2)
-    v    = jnp.asarray(v)        # (B, H, 2, d_head)
+    # Host output buffers
+    pre_from_a = _np.empty((Bsize, d_mlp), dtype=_np.float32)
+    pre_from_b = _np.empty((Bsize, d_mlp), dtype=_np.float32)
+    pre_total  = _np.empty((Bsize, d_mlp), dtype=_np.float32)
+    pre_hook   = _np.empty((Bsize, d_mlp), dtype=_np.float32)
 
-    # 3) W_O (combine heads), and MLP layer-1 weights/bias
-    W_O = jnp.asarray(params["blocks_0"]["attn"]["W_O"])  # (d_model, H*d_head)
-    W0  = jnp.asarray(params["blocks_0"]["mlp"]["W_0"])   # (d_mlp, d_model)
-    b0  = jnp.asarray(params["blocks_0"]["mlp"]["b_0"])   # (d_mlp,)
+    # Decide chunk size ~ target_chunk_mb
+    bytes_per_elem = 2 if use_bfloat16 else 4
+    # We’ll hold a few arrays of shape (chunk, d_mlp) on device; be conservative (×4)
+    denom = max(1, 4 * d_mlp * bytes_per_elem)
+    chunk = max(256, (target_chunk_mb * 1024 * 1024) // denom)
+    # also don’t exceed the dataset
+    chunk = int(min(chunk, Bsize))
 
-    # 4) Residual for token-1: (E_b + pos1)
-    Wa, Wb = model.extract_embeddings_ab(params)  # (p,D), (p,D)
-    pos0, pos1 = params["pos_embed"]["W_pos"][:2] # (D,), (D,)
-    b_idx = x_full[:, 1]
-    Eb_pos1 = jnp.asarray(Wb)[b_idx] + jnp.asarray(pos1)  # (B, D)
-
-    # 5) Attention contributions for query token = last_token_index
+    # Build the full (a,b) grid indices on host
+    a = _np.arange(group_size, dtype=_np.int32)
+    b = _np.arange(group_size, dtype=_np.int32)
+    A, B = _np.meshgrid(a, b, indexing="ij")
+    X_full = _np.stack([A.ravel(), B.ravel()], axis=-1)      # (Bsize, 2)
     q = int(last_token_index)  # 1
-    # from 'a' (src token 0) and from 'b' (src token 1)
-    z_from_a = v[:, :, 0, :] * attn[:, :, q, 0][..., None]  # (B, H, d_head)
-    z_from_b = v[:, :, 1, :] * attn[:, :, q, 1][..., None]  # (B, H, d_head)
 
-    # flatten heads then map with W_O to model space
-    zfa = z_from_a.reshape(Bsize, -1)  # (B, H*d_head)
-    zfb = z_from_b.reshape(Bsize, -1)  # (B, H*d_head)
-    attn_from_a = jnp.einsum("df,bf->bd", W_O, zfa)  # (B, d_model)
-    attn_from_b = jnp.einsum("df,bf->bd", W_O, zfb)  # (B, d_model)
+    # Helper: optionally downcast attn/v for memory
+    _dtype = jnp.bfloat16 if use_bfloat16 else jnp.float32
 
-    # 6) Compose x_mid[1] contributions
-    xmid_from_a = attn_from_a              # only via attention
-    xmid_from_b = Eb_pos1 + attn_from_b    # residual + attention
+    # Stream over chunks
+    for i0 in range(0, Bsize, chunk):
+        i1 = min(Bsize, i0 + chunk)
 
-    # 7) Map to MLP layer-1 preactivations
-    pre_L1_from_a = jnp.einsum("md,bd->bm", W0, xmid_from_a)  # (B, d_mlp)
-    pre_L1_from_b = jnp.einsum("md,bd->bm", W0, xmid_from_b)  # (B, d_mlp)
+        # Inputs for this batch
+        x_chunk = jnp.asarray(X_full[i0:i1, :], dtype=jnp.int32)  # (Nc, 2)
+        b_idx   = _np.asarray(X_full[i0:i1, 1])                   # host ints
+        # residual for token-1 on host, then move to device
+        Eb_pos1 = _np.asarray(Wb[b_idx] + pos1, dtype=_np.float32)  # (Nc, D)
+        Eb_pos1 = jnp.asarray(Eb_pos1)
 
-    # add bias according to your preference
-    if bias_mode == "b":
-        pre_L1_from_b = pre_L1_from_b + b0
-    elif bias_mode == "even":
-        half = 0.5 * b0
-        pre_L1_from_a = pre_L1_from_a + half
-        pre_L1_from_b = pre_L1_from_b + half
-    elif bias_mode == "none":
-        pass
-    else:
-        raise ValueError("bias_mode must be one of {'b','even','none'}")
+        # Forward w/ intermediates for this chunk only
+        _, inter = model.apply({"params": params}, x_chunk, training=False, mutable=["intermediates"])
+        ints = inter["intermediates"]
 
-    pre_L1_total = pre_L1_from_a + pre_L1_from_b
+        # Grab attention hooks
+        attn = _find_by_suffix(ints, "blocks_0/attn/hook_attn")
+        v    = _find_by_suffix(ints, "blocks_0/attn/hook_v")
+        if attn is None: attn = _find_by_suffix(ints, "hook_attn")
+        if v is None:    v    = _find_by_suffix(ints, "hook_v")
+        if attn is None or v is None:
+            raise KeyError("Could not find attention hooks (hook_attn, hook_v).")
 
-    # 8) (optional) grab true hook_pre1 for sanity
-    pre1_hook = _find_by_suffix(ints, "blocks_0/mlp/hook_pre1")
-    if pre1_hook is None:
-        pre1_hook = _find_by_suffix(ints, "hook_pre1")
-    if pre1_hook is None:
-        raise KeyError("Could not find 'hook_pre1' in intermediates.")
-    # slice last token and make (B, d_mlp)
-    pre_L1_hook = jnp.asarray(pre1_hook)[:, q, :]
+        attn = jnp.asarray(attn, _dtype)      # (Nc, H, 2, 2)
+        v    = jnp.asarray(v,    _dtype)      # (Nc, H, 2, d_head)
 
-    # to numpy
-    return (
-        np.asarray(pre_L1_from_a),
-        np.asarray(pre_L1_from_b),
-        np.asarray(pre_L1_total),
-        np.asarray(pre_L1_hook),
-    )
+        # From src token 0/1 to query token q
+        z_from_a = v[:, :, 0, :] * attn[:, :, q, 0][..., None]  # (Nc, H, d_head)
+        z_from_b = v[:, :, 1, :] * attn[:, :, q, 1][..., None]  # (Nc, H, d_head)
+
+        # Collapse heads then map with W_O
+        zfa = z_from_a.reshape(z_from_a.shape[0], -1)           # (Nc, H*d_head)
+        zfb = z_from_b.reshape(z_from_b.shape[0], -1)           # (Nc, H*d_head)
+        attn_from_a = jnp.einsum("df,bf->bd", W_O, zfa)         # (Nc, d_model)
+        attn_from_b = jnp.einsum("df,bf->bd", W_O, zfb)         # (Nc, d_model)
+
+        # x_mid for token-1
+        xmid_from_a = attn_from_a
+        xmid_from_b = Eb_pos1 + attn_from_b
+
+        # Map to MLP preacts
+        pre_a_chunk = jnp.einsum("md,bd->bm", W0, xmid_from_a)  # (Nc, d_mlp)
+        pre_b_chunk = jnp.einsum("md,bd->bm", W0, xmid_from_b)  # (Nc, d_mlp)
+
+        # Add bias as requested (device-side; small tensors)
+        if bias_mode == "b":
+            pre_b_chunk = pre_b_chunk + b0
+        elif bias_mode == "even":
+            half = 0.5 * b0
+            pre_a_chunk = pre_a_chunk + half
+            pre_b_chunk = pre_b_chunk + half
+        elif bias_mode == "none":
+            pass
+        else:
+            raise ValueError("bias_mode must be one of {'b','even','none'}")
+
+        # True hook_pre1 for sanity
+        pre1_hook = _find_by_suffix(ints, "blocks_0/mlp/hook_pre1")
+        if pre1_hook is None:
+            pre1_hook = _find_by_suffix(ints, "hook_pre1")
+        if pre1_hook is None:
+            raise KeyError("Could not find 'hook_pre1' in intermediates.")
+        pre1_hook = jnp.asarray(pre1_hook)[:, q, :]            # (Nc, d_mlp)
+
+        # Move this batch to host (releasing device memory quickly)
+        pa = _np.asarray(pre_a_chunk, dtype=_np.float32)
+        pb = _np.asarray(pre_b_chunk, dtype=_np.float32)
+        ph = _np.asarray(pre1_hook,   dtype=_np.float32)
+
+        pre_from_a[i0:i1, :] = pa
+        pre_from_b[i0:i1, :] = pb
+        pre_total [i0:i1, :] = pa + pb
+        pre_hook  [i0:i1, :] = ph
+
+        # Encourage early freeing
+        del attn, v, z_from_a, z_from_b, zfa, zfb, attn_from_a, attn_from_b
+        del xmid_from_a, xmid_from_b, pre_a_chunk, pre_b_chunk, pre1_hook
+        jax.clear_backends() if hasattr(jax, "clear_backends") else None
+
+    return pre_from_a, pre_from_b, pre_total, pre_hook
 
 # ---------- last-layer cluster → logits (Transformer effective map) ----------
 def cluster_contribs_last_layer_transformer(

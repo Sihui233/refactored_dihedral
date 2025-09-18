@@ -142,7 +142,7 @@ def main(argv):
             epochs=cfg.epochs,
             eval_batches=(x_eval_batches, y_eval_batches),
             eval_every=1,
-            # eval_flat=(x_eval, y_eval),  # for margins
+            # eval_flat=(x_eval, y_eval),  # for margins, whole grid
             # eval_fn=eval_fn,             # you could pass eval_batches=(x_eval_batches, y_eval_batches) instead
         )
 
